@@ -1,3 +1,7 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- parses the metrics secret before hashing so blank values keep the endpoint closed. See
+-- BBB-CHANGES.md.
+
 -- TODO(SOLOMON): Should this be moved into `Data.Environment`?
 module Hasura.Server.Init.Env
   ( -- * WithEnv
@@ -204,6 +208,9 @@ instance FromEnv Integer where
 
 instance FromEnv Auth.AdminSecretHash where
   fromEnv = Right . Auth.hashAdminSecret . Text.pack
+
+instance FromEnv Config.MetricsSecret where
+  fromEnv = Right . Config.mkMetricsSecret . Text.pack
 
 instance FromEnv RoleName where
   fromEnv string =

@@ -39,6 +39,8 @@ module Hasura.Server.Init.Config
 
     -- * ServeOptionsRaw
     ServeOptionsRaw (..),
+    MetricsSecret (..),
+    mkMetricsSecret,
     ConsoleStatus (..),
     isConsoleEnabled,
     AdminInternalErrorsStatus (..),
@@ -88,6 +90,7 @@ import Control.Lens (Lens', Prism')
 import Control.Lens qualified as Lens
 import Data.Aeson (FromJSON, ToJSON, (.:), (.:?), (.=))
 import Data.Aeson qualified as J
+import Data.Char qualified as Char
 import Data.Scientific qualified as Scientific
 import Data.Text qualified as Text
 import Data.Time qualified as Time
@@ -279,6 +282,15 @@ _HCServe = Lens.prism' HCServe \case
 
 --------------------------------------------------------------------------------
 
+-- | A metrics secret parsed before hashing, preserving only whether it was blank.
+data MetricsSecret = BlankMetricsSecret | MetricsSecret Auth.AdminSecretHash
+  deriving stock (Show)
+
+mkMetricsSecret :: Text -> MetricsSecret
+mkMetricsSecret secret
+  | Text.all Char.isSpace secret = BlankMetricsSecret
+  | otherwise = MetricsSecret (Auth.hashAdminSecret secret)
+
 -- | The Serve Command options accumulated from the Arg and Env parsers.
 --
 -- NOTE: A 'Nothing' value indicates the absence of a particular
@@ -356,7 +368,7 @@ data ServeOptionsRaw impl = ServeOptionsRaw
     rsoLogMaskedVariables :: Maybe (HashSet Text),
     rsoRelayMode :: RelayModeStatus,
     rsoRemoteSchemaHealingInterval :: Maybe OptionalInterval,
-    rsoMetricsSecret :: Maybe Auth.AdminSecretHash
+    rsoMetricsSecret :: Maybe MetricsSecret
   }
 
 deriving stock instance (Show (Logging.EngineLogType impl)) => Show (ServeOptionsRaw impl)

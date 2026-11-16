@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret to the raw serve options. See BBB-CHANGES.md.
+-- adds the metrics secret to the raw serve options and tests that a blank one counts as
+-- not set. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 module Hasura.Server.InitSpec
@@ -10,6 +11,7 @@ where
 --------------------------------------------------------------------------------
 
 import Data.HashSet qualified as Set
+import Data.Text qualified as Text
 import Data.Time (NominalDiffTime)
 import Database.PG.Query qualified as Query
 import Hasura.Authentication.Role qualified as Roles
@@ -328,6 +330,24 @@ mkServeOptionsSpec =
             result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura rawServeOptions)
 
         fmap UUT.soAdminSecret result `Hspec.shouldBe` Right (Set.singleton (Auth.hashAdminSecret "Whats the big deal"))
+
+    Hspec.describe "soMetricsSecret" $ do
+      Hspec.it "Env > Nothing" $ do
+        let env = [(UUT._envVar UUT.metricsSecretOption, "metrics secret")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right (Just (Auth.hashAdminSecret "metrics secret"))
+
+      for_ [("empty", ""), ("spaces", "   "), ("tab", "\t")] $ \(description, blank) -> do
+        Hspec.it ("a " <> description <> " environment secret counts as not set") $ do
+          let env = [(UUT._envVar UUT.metricsSecretOption, blank)]
+              result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+          fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right Nothing
+
+        Hspec.it ("a " <> description <> " command-line secret counts as not set and overrides the environment") $ do
+          let env = [(UUT._envVar UUT.metricsSecretOption, "metrics secret")]
+              rawServeOptions = emptyServeOptionsRaw {UUT.rsoMetricsSecret = Just (UUT.mkMetricsSecret $ Text.pack blank)}
+              result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura rawServeOptions)
+          fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right Nothing
 
     Hspec.describe "soAuthHook" $ do
       Hspec.it "Default Hook Mode == GET" $ do

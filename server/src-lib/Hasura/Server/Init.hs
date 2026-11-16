@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret serve option. See BBB-CHANGES.md.
+-- adds the metrics secret serve option, a blank value counting as no secret. See
+-- BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 
 -- | Arg and Env Parsing for initialisation of the engine along with
@@ -244,12 +245,27 @@ mkServeOptions sor@ServeOptionsRaw {..} = do
     case rsoDisableNativeQueryValidation of
       NativeQuery.AlwaysValidateNativeQueries -> withOptionDefault Nothing disableNativeQueryValidationOption
       NativeQuery.NeverValidateNativeQueries -> pure NativeQuery.NeverValidateNativeQueries
-  soPreserve401Errors <- withOptionSwitch' rsoPreserve401Errors (\case { MapEverythingTo200 -> False; Preserve401Errors -> True }, bool MapEverythingTo200 Preserve401Errors) preserve401ErrorsOption
+  soPreserve401Errors <-
+    withOptionSwitch'
+      rsoPreserve401Errors
+      ( \case
+          MapEverythingTo200 -> False
+          Preserve401Errors -> True,
+        bool MapEverythingTo200 Preserve401Errors
+      )
+      preserve401ErrorsOption
   soServerTimeout <- withOptionDefault rsoServerTimeout serverTimeoutOption
   soLogMaskedVariables <- withOptionDefault rsoLogMaskedVariables logMaskedVariablesOption
   soRelayMode <- withOptionSwitch' rsoRelayMode (isRelayEnabled, bool RelayModeDisabled RelayModeEnabled) enableRelayOption
   soRemoteSchemaHealingInterval <- withOptionDefault rsoRemoteSchemaHealingInterval remoteSchemaHealingIntervalOption
-  soMetricsSecret <- withOption rsoMetricsSecret metricsSecretOption
+  -- A blank metrics secret counts as no secret, so the endpoint stays closed.
+  soMetricsSecret <-
+    withOption rsoMetricsSecret metricsSecretOption
+      <&> ( >>=
+              \case
+                BlankMetricsSecret -> Nothing
+                MetricsSecret secret -> Just secret
+          )
   pure ServeOptions {..}
 
 -- | Fetch Postgres 'Query.ConnParams' components from the environment

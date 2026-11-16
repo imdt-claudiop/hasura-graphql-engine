@@ -47,8 +47,8 @@ Behavior and configuration:
   enum already exists in the community edition); it returns 404 otherwise.
 - `HASURA_GRAPHQL_METRICS_SECRET` secures the endpoint: requests must send
   `Authorization: Bearer <secret>` and receive 401 otherwise. The endpoint is fail-closed:
-  if the secret is not set, every request is rejected with 401, so enabling the metrics API
-  without configuring a secret exposes nothing.
+  if the secret is not set, or is blank (empty or whitespace only), every request is rejected with
+  401, so enabling the metrics API without configuring a secret exposes nothing.
 - The response is `text/plain; version=0.0.4` and contains the Prometheus metrics sample
   followed by the metrics of the EKG store, converted to the Prometheus text format by
   `Hasura.Server.Prometheus.EkgExport`.
@@ -186,9 +186,12 @@ Every file below carries a modification notice at the top, as required by Apache
   text conversion.
 - `server/src-lib/Hasura/Server/Init/Arg/Command/Serve.hs`,
   `server/src-lib/Hasura/Server/Init.hs`, `server/src-lib/Hasura/Server/Init/Config.hs`,
+  `server/src-lib/Hasura/Server/Init/Env.hs`,
   `server/src-lib/Hasura/App/State.hs`: add the `HASURA_GRAPHQL_METRICS_SECRET` option and
   carry it into the app context.
-- `server/src-test/Hasura/Server/InitSpec.hs`: adds the new raw serve option default.
+- `server/src-test/Hasura/Server/InitSpec.hs`: adds the new raw serve option default, and
+  tests that the metrics secret is read hashed and that a blank one counts as not set for
+  both the environment and command-line option.
 - `server/test-postgres/Constants.hs` and `server/lib/test-harness/src/Harness/Constants.hs`:
   add the new serve option default to the test fixtures.
 - `server/src-test/Hasura/Server/PrometheusSpec.hs` (new file): tests that every metric
