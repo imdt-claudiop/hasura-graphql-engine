@@ -88,6 +88,36 @@ with a per-operation liveness flag (`STM.TVar Bool`) created before `addLiveQuer
 and cleared in the same STM transaction that removes the operation from the map, so
 the startup window delivers and a straggler poll after teardown is still dropped.
 
+## Operation name count of streaming subscriptions
+
+Each poller keeps a count of its subscribers per operation name, and the poll metrics use
+the names in that count as their `operation_name` label. `removeStreamingQuery` looks the
+removed subscriber up in every cohort of the poller, and it decremented the count once per
+cohort it visited rather than once for the subscriber, so with subscribers of one name in
+several cohorts the name left the count while some of them were still active (live
+queries had the same defect on a repeated removal). The count is now
+decremented once, and only when the subscriber is still in one of the poller's cohorts.
+
+A subscriber can end up in two cohorts of a streaming poller, against the design the
+poller documents. When a subscriber joins a cohort while a poll is advancing that cohort's
+cursor, the comment in the cohort map rebuild of `pollStreamingQuery` says it stays only in
+a cohort under the old key, to get its first result from the initial cursor. The code
+creates that cohort, but the cohort it moves to the new key is the same object as the
+original, and the filter that keeps its subscribers keeps the newcomer too, so the newcomer
+is in both until their keys coincide again. The metrics count that subscriber down once.
+They do not fix the related upstream bug where emptying the new cohort can delete the
+first map entry with the same cohort id, which can be the twin that still has subscribers;
+later removals from the deleted twin leave active-subscription and per-operation poller
+gauges one above until the cohort bug is fixed. `removeStreamingQuery` also decremented
+`hasura_active_subscriptions` once per cohort the subscriber was in, so such a subscriber
+was counted down twice. It is now counted down once, under the same condition as the
+operation name. Live queries verify membership in their single cohort and decrement once,
+including when removal is attempted more than once.
+When the removal empties the poller and its thread is not installed (a state the code logs
+as a bug), the base did not count the gauge down, for live queries or streaming
+subscriptions, and now it does for both, which matches the unconditional count up when the
+subscriber was added.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -118,5 +148,17 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
   `server/src-lib/Hasura/GraphQL/Transport/WebSocket/Types.hs`: per-operation liveness
   flag for subscription pushes (see "Live query first-result race" above).
+- `server/src-lib/Hasura/GraphQL/Execute/Subscription/State.hs`: decrements the operation
+  name count and `hasura_active_subscriptions` once per removed streaming subscriber, and
+  counts the gauge down when a removal empties a poller without a thread (see "Operation
+  name count of streaming subscriptions" above).
+- `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`: tests that count when
+  subscribers of one operation name are removed from two cohorts, and the count and the
+  active subscriptions gauge when a subscriber that is in two cohorts is removed, and when
+  the last subscriber of a live query poller without a thread is removed. The first test
+  replaces the upstream test "adding a new subscriber concurrently should place the
+  subscriber in the appropriate cohort", which ran its poll after the suite's teardown had
+  dropped the table, so the cohort's key never advanced and its assertions passed
+  vacuously.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
