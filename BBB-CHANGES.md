@@ -162,6 +162,14 @@ with the exception.
 The help of `hasura_subscription_db_execution_time_seconds` says the pool wait is left
 out.
 
+## Help of the full send queue counter
+
+When a connection's websocket send queue is full, the message is not sent and the
+operation it belongs to is cancelled (`cancelOperationOnOvercapacity` in
+`Hasura.GraphQL.Transport.WebSocket`). The help of `hasura_websocket_messages_dropped_total`
+said the message was dropped; it now says it was rejected and that each rejection cancels
+its operation. The metric name is unchanged.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -225,5 +233,8 @@ Every file below carries a modification notice at the top, as required by Apache
   ends with a statement error or an exception, and of a poll batch that gets no
   connection. The pool-exhaustion tests synchronize with the connection holders instead
   of assuming they acquired the pool within a fixed delay.
+- `server/src-lib/Hasura/Server/Prometheus.hs`: also changes the help of
+  `hasura_websocket_messages_dropped_total` (see "Help of the full send queue counter"
+  above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs`.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
