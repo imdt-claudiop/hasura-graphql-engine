@@ -295,6 +295,16 @@ always on.
     query are its poll batches (one per poll while the poller's cohorts fit in one batch) plus
     one validation run per subscription start (`testMultiplexedQueryTx`,
     `Hasura.Backends.Postgres.Instances.Execute`), which no metric counts as a poll.
+  - `hasura_subscription_cohorts_processed_total` counts, for each operation the poller serves,
+    the cohorts the poll processed; `hasura_active_subscription_cohorts_by_operation` holds,
+    for each operation, the cohorts of the pollers serving it, as of each poller's last poll.
+    Both count the cohorts of the pollers, not the operation's subscribers, so the series of
+    two operations sharing a poller count the same cohorts, and the poll does no work per
+    subscriber for them. The gauge changes when a poller polls (an operation that left the
+    poller drops out at the next poll) and when a poller is removed. A poller is registered
+    when it is created and forgotten when it is removed, including the defensive path where
+    its worker state was not installed. A poll that ends after removal (its thread is stopped,
+    not awaited) changes nothing.
 
 ## Formatting
 
@@ -357,6 +367,8 @@ Every file below carries a modification notice at the top, as required by Apache
   subscriber in the appropriate cohort", which ran its poll after the suite's teardown had
   dropped the table, so the cohort's key never advanced and its assertions passed
   vacuously.
+  Per-operation metric scenarios park the poller's own thread before its first poll, so
+  only the poll explicitly driven by the test contributes observations.
 - `server/src-lib/Hasura/GraphQL/Execute.hs`: builds the streaming subscription plan once
   (see "Streaming subscription plan built once" above).
 - `server/src-lib/Hasura/Server/Prometheus.hs`: observes a subscription poll once (see "One
@@ -401,11 +413,13 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-test/Hasura/Server/VersionSpec.hs`: tests the version form of a test build
   (see `scripts/build-v2.sh` above).
 - `server/src-lib/Hasura/Server/Prometheus.hs`, `server/src-lib/Hasura/GraphQL/Execute/Subscription/State.hs`,
+  `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/Common.hs`,
   `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/LiveQuery.hs`,
   `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/StreamingQuery.hs`,
   `server/src-lib/Hasura/GraphQL/Transport/HTTP.hs`, `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
   `server/src-lib/Hasura/GraphQL/Transport/WebSocket/Server.hs`: the per-operation subscription metrics (see
   "Per-operation subscription metrics" above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs` and
-  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`.
+  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`; `Common` adds `_pPollerId`
+  so metrics can forget a poller whose worker state is not installed.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

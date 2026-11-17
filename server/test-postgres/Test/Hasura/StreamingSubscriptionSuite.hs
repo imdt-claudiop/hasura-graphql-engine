@@ -425,7 +425,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
 
         streamQueryMapEntries <- STM.atomically $ ListT.toList $ STMMap.listT streamQueryMap
         length streamQueryMapEntries `shouldBe` 1
-        let (pollerKey, (Poller currentCohortMap _ ioState _ _)) = head streamQueryMapEntries
+        let (pollerKey, (Poller currentCohortMap _ ioState _ _ _)) = head streamQueryMapEntries
         cohorts <- STM.atomically $ TMap.toList currentCohortMap
         length cohorts `shouldBe` 1
         let (_cohortKey, Cohort _ _ curSubsTV newSubsTV _) = head cohorts
@@ -502,7 +502,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
       subscriberB <- runIO $ addSubscriber subscriberBMetadata requestIdB (queryPlanFor cohortIdB cohortKeyB)
 
       it "both subscribers share one poller, in two cohorts, and the operation name is counted twice" $ do
-        Just (Poller pollerCohorts _ _ _ _) <- pollerOf
+        Just (Poller pollerCohorts _ _ _ _ _) <- pollerOf
         cohorts <- STM.atomically $ TMap.toList pollerCohorts
         length cohorts `shouldBe` 2
         operationNameCount `shouldReturn` Just 2
@@ -555,7 +555,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           -- One poll of the poller's cohorts, recorded in a fresh set of metrics.
           pollOnce metricsState = do
             entries <- STM.atomically $ ListT.toList $ STMMap.listT (_ssStreamQueryMap subscriptionState)
-            Poller pollerCohorts _ _ _ pollerOperationNames <- maybe (error "no poller") (pure . snd) (listToMaybe entries)
+            Poller pollerCohorts _ _ _ _ pollerOperationNames <- maybe (error "no poller") (pure . snd) (listToMaybe entries)
             promMetrics <- makeDummyPrometheusMetrics
             pollStreamingQuery
               @('Postgres 'Vanilla)
@@ -729,6 +729,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                 Nothing
             activeSubscriptions = sum . Map.elems <$> GaugeVector.read (submActiveSubscriptions $ pmSubscriptionMetrics promMetrics)
             operationNameCount poller = STM.atomically $ TMap.lookup operationName (_pOperationNamesMap poller)
+            pollerIsReported poller = HashMap.member (unPollerId (_pPollerId poller)) <$> readIORef (submReportedCohorts $ pmSubscriptionMetrics promMetrics)
         let joinLive name =
               addLiveQuery @('Postgres 'Vanilla)
                 quietLogger
@@ -754,11 +755,12 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         ioState <- STM.atomically (STM.takeTMVar (_pIOState poller))
         Immortal.stop (_pThread ioState)
         let snapshot =
-              (,,,)
+              (,,,,)
                 <$> activeSubscriptions
                 <*> operationNameCount poller
                 <*> EKG.Gauge.read (smActiveSubscriptions serverMetrics)
                 <*> EKG.Gauge.read (smActiveLiveQueries serverMetrics)
+                <*> pollerIsReported poller
         before <- snapshot
         removeLiveQuery quietLogger serverMetrics promMetrics subscriptionState first (pure GranularMetricsOff) operationName
         afterFirst <- snapshot
@@ -770,10 +772,10 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
 
       it "keeps every count unchanged on double removal and counts every metric down when the last subscriber has no installed thread" $ do
         let (before, afterFirst, afterSecond, afterLast) = activeBeforeAndAfter
-        before `shouldSatisfy` \(active, names, _, _) -> (active, names) == (2, Just 2)
-        afterFirst `shouldSatisfy` \(active, names, _, _) -> (active, names) == (1, Just 1)
+        before `shouldSatisfy` \(active, names, _, _, reported) -> (active, names, reported) == (2, Just 2, True)
+        afterFirst `shouldSatisfy` \(active, names, _, _, reported) -> (active, names, reported) == (1, Just 1, True)
         afterSecond `shouldBe` afterFirst
-        afterLast `shouldBe` (0, Nothing, 0, 0)
+        afterLast `shouldBe` (0, Nothing, 0, 0, False)
 
     describe "Per-operation subscription metrics" $ do
       let -- A poller whose only polls are the ones a test runs: a sentinel subscriber, on a
@@ -785,6 +787,8 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
             wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
             received <- newIORef ([] :: [(Text, Int)])
             let subOptions = mkSubscriptionsOptions Nothing Nothing
+                -- The poller stays parked before its first poll until the test stops it.
+                getOptions = forever (threadDelay maxBound)
                 quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
                 plan cohortId cursor =
                   SubscriptionQueryPlan
@@ -805,7 +809,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                     promMetrics
                     (mkSubscriberMetadata wsId (unsafeMkOperationId name) Nothing (RequestId name))
                     subscriptionState
-                    (pure (subOptions, subOptions))
+                    getOptions
                     SNDefault
                     paramQueryHash
                     opName
@@ -820,13 +824,14 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                 leaveNamed opName details =
                   removeStreamingQuery quietLogger dummyServerMetrics promMetrics subscriptionState details (pure GranularMetricsOff) opName
                 pollers = STM.atomically $ fmap snd <$> ListT.toList (STMMap.listT (_ssStreamQueryMap subscriptionState))
-            _ <- joinNamed (Just (OperationName [G.name|Sentinel|])) "sentinel" 1000
+            sentinel <- joinNamed (Just (OperationName [G.name|Sentinel|])) "sentinel" 1000
             poller <- maybe (error "no poller") pure . listToMaybe =<< pollers
-            STM.atomically (STM.readTMVar (_pIOState poller)) >>= Immortal.stop . _pThread
+            ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
+            Immortal.stop (_pThread ioState)
             let poll duringPoll =
                   pollStreamingQuery
                     @('Postgres 'Vanilla)
-                    pollerId
+                    (_pId ioState)
                     pollerResponseState
                     defaultSubscriptionOptions
                     (SNDefault, srcConfig)
@@ -847,7 +852,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                     (pure ModelInfoLogOff)
                 stopAll = pollers >>= traverse_ \p -> STM.atomically (STM.tryReadTMVar (_pIOState p)) >>= traverse_ (Immortal.stop . _pThread)
             atomicModifyIORef' received (\_ -> ([], ()))
-            pure OpScenario {osJoin = joinNamed, osLeave = leaveNamed, osPoll = poll, osMetrics = promMetrics, osReceived = readIORef received, osStop = stopAll}
+            pure OpScenario {osJoin = joinNamed, osLeave = leaveNamed, osSentinel = sentinel, osPoll = poll, osMetrics = promMetrics, osReceived = readIORef received, osStop = stopAll}
           op = Just . OperationName . unsafeMkName
           -- The value of a per-operation series of the streaming kind.
           byOperation :: CounterVector.CounterVector SubscriptionLabel -> Text -> IO Double
@@ -880,6 +885,38 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         it "a failed batch counts once for each operation, and the failed poll is still a poll" $ do
           pollsAfterError `shouldBe` [2, 2, 2]
           errorsAfterError `shouldBe` [1, 1, 1]
+
+      describe "cohorts processed and active cohorts" $ do
+        -- First has subscribers on cursors 1 and 2, Second shares the cursor 1 cohort, and the
+        -- sentinel is on its own cohort: three cohorts. The cursors advance one row a poll, so the
+        -- cohorts never merge.
+        (afterFirstPoll, afterLeaving, afterRemoval) <- runIO do
+          OpScenario {..} <- newOpScenario
+          a <- osJoin (op "First") "a" 1
+          b <- osJoin (op "First") "b" 2
+          c <- osJoin (op "Second") "c" 1
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              names = ["First", "Second", "Sentinel"]
+              gaugeOf name = Map.findWithDefault 0 (SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) <$> GaugeVector.read submActiveCohortsByOperation
+              snapshot = (,) <$> traverse (byOperation submCohortsProcessedByOperation) names <*> traverse gaugeOf names
+          osPoll Nothing
+          polled <- snapshot
+          -- Second leaves, and so does b, which empties the cursor 2 cohort.
+          osLeave (op "Second") c
+          osLeave (op "First") b
+          osPoll Nothing
+          leaving <- snapshot
+          osLeave (op "First") a
+          osLeave (op "Sentinel") osSentinel
+          removal <- snapshot
+          osStop
+          pure (polled, leaving, removal)
+        it "a poll counts the cohorts of the poller for each operation it serves" $ do
+          afterFirstPoll `shouldBe` ([3, 3, 3], [3, 3, 3])
+        it "an operation that leaves the poller drops out of the gauge, and its count stays" $ do
+          afterLeaving `shouldBe` ([5, 3, 5], [2, 0, 2])
+        it "removing the poller takes its cohorts out of the gauge" $ do
+          afterRemoval `shouldBe` ([5, 3, 5], [0, 0, 0])
 
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId
@@ -990,6 +1027,8 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
 data OpScenario = OpScenario
   { osJoin :: Maybe OperationName -> Text -> Int -> IO SubscriberDetails,
     osLeave :: Maybe OperationName -> SubscriberDetails -> IO (),
+    -- | The subscriber that keeps the poller alive, of the operation @Sentinel@.
+    osSentinel :: SubscriberDetails,
     osPoll :: Maybe (IO ()) -> IO (),
     osMetrics :: PrometheusMetrics,
     osReceived :: IO [(Text, Int)],

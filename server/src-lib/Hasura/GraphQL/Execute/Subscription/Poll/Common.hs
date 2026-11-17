@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine): the poller record keeps its PollerId so per-operation metrics can forget a poller whose worker state is not installed. See BBB-CHANGES.md.
+
 -- | Multiplexed subscription poller threads; see "Hasura.GraphQL.Execute.Subscription" for details.
 module Hasura.GraphQL.Execute.Subscription.Poll.Common
   ( -- * Pollers
@@ -258,6 +260,9 @@ data Poller streamCursor = Poller
     -- TODO this could probably be tightened up to something like
     -- 'STM PollerIOState'
     _pIOState :: STM.TMVar PollerIOState,
+    -- | The identity used by per-operation metrics remains available while the
+    -- worker state is being installed or has been taken for cleanup.
+    _pPollerId :: !PollerId,
     _pParameterizedQueryHash :: ParameterizedQueryHash,
     -- The operation names of the subscriptions that are part of this poller. This is
     -- used while emitting subscription metrics
@@ -271,8 +276,8 @@ data PollerIOState = PollerIOState
     _pId :: !PollerId
   }
 
-data PollerKey b =
-  -- we don't need operation name here as a subscription will only have a
+data PollerKey b
+  = -- we don't need operation name here as a subscription will only have a
   -- single top level field
   PollerKey
   { _lgSource :: SourceName,
@@ -307,7 +312,7 @@ dumpPollerMap :: Bool -> PollerMap streamCursor -> IO J.Value
 dumpPollerMap extended pollerMap =
   fmap J.toJSON $ do
     entries <- STM.atomically $ ListT.toList $ STMMap.listT pollerMap
-    forM entries $ \(pollerKey, Poller cohortsMap _responseState ioState _paramQueryHash _opNames) ->
+    forM entries $ \(pollerKey, Poller cohortsMap _responseState ioState _pollerId _paramQueryHash _opNames) ->
       AB.dispatchAnyBackend @Backend (unBackendPollerKey pollerKey) $ \(PollerKey source role query _connectionKey _) -> do
         PollerIOState threadId pollerId <- STM.atomically $ STM.readTMVar ioState
         cohortsJ <-
