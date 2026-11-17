@@ -36,7 +36,7 @@ import Hasura.Backends.Postgres.Execute.Subscription (MultiplexedQuery (Multiple
 import Hasura.Backends.Postgres.Instances.Transport (withQueryExecutionTime)
 import Hasura.Backends.Postgres.SQL.Value (TxtEncodedVal (TELit))
 import Hasura.Base.Error (Code (Unexpected), QErr, err500, showQErr)
-import Hasura.GraphQL.Execute.Subscription.Options (mkSubscriptionsOptions)
+import Hasura.GraphQL.Execute.Subscription.Options (RefetchInterval (..), SubscriptionsOptions, mkSubscriptionsOptions)
 import Hasura.GraphQL.Execute.Subscription.Plan
 import Hasura.GraphQL.Execute.Subscription.Poll.Common
 import Hasura.GraphQL.Execute.Subscription.Poll.LiveQuery (pollLiveQuery)
@@ -57,11 +57,12 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (ServerMetrics (smActiveLiveQueries, smActiveStreamingSubscriptions, smActiveSubscriptions), createServerMetrics)
-import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionChangedLabel (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, registerPollerByOperation, splitBySubscribers, streamingSubscriptionLabel, wholeMicroseconds)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionChangedLabel (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, observePollStart, registerPollerByOperation, splitBySubscribers, streamingSubscriptionLabel, wholeMicroseconds)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax (unsafeMkName)
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
+import Refined.Unsafe (unsafeRefine)
 import StmContainers.Map qualified as STMMap
 import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
@@ -783,14 +784,18 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
       let -- A poller whose only polls are the ones a test runs: a sentinel subscriber, on a
           -- cursor past every row, creates it, and its thread is stopped at once.
           newOpScenario :: IO OpScenario
-          newOpScenario = do
+          newOpScenario = newOpScenarioWith (mkSubscriptionsOptions Nothing Nothing) True
+          -- The same, with the given options, and with the poller's thread left running if
+          -- not stopped.
+          newOpScenarioWith :: SubscriptionsOptions -> Bool -> IO OpScenario
+          newOpScenarioWith subOptions stopThread = do
             subscriptionState <- initSubscriptionsState (const (pure ()))
             promMetrics <- makeDummyPrometheusMetrics
             wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
             received <- newIORef ([] :: [(Text, Int)])
-            let subOptions = mkSubscriptionsOptions Nothing Nothing
-                -- Keep the real poller parked; tests invoke its poll function explicitly.
-                getOptions = forever (threadDelay maxBound)
+            let -- When requested, the poller stays parked before its first poll until the test stops it.
+                getOptions =
+                  if stopThread then forever (threadDelay maxBound) else pure (subOptions, subOptions)
                 quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
                 plan cohortId cursor =
                   SubscriptionQueryPlan
@@ -829,7 +834,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
             sentinel <- joinNamed (Just (OperationName [G.name|Sentinel|])) "sentinel" 1000
             poller <- maybe (error "no poller") pure . listToMaybe =<< pollers
             ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
-            Immortal.stop (_pThread ioState)
+            when stopThread $ Immortal.stop (_pThread ioState)
             pollDetails <- newIORef []
             let poll duringPoll =
                   pollStreamingQuery
@@ -1023,17 +1028,43 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           sum (map snd totalTime) `shouldBe` fromIntegral (sum (map totalOf details))
           totalTime `shouldBe` expectedFrom totalOf
 
+      describe "time between polls" $ do
+        -- A running poller, polling every 0.2 s, for about a second.
+        (intervals, polls) <- runIO do
+          let every = RefetchInterval (unsafeRefine 0.2)
+          OpScenario {..} <- newOpScenarioWith (mkSubscriptionsOptions Nothing (Just every)) False
+          threadDelay 1100000
+          osLeave (op "Sentinel") osSentinel
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+          intervals <- Map.lookup streamingSubscriptionLabel <$> HistogramVector.read submPollInterval
+          polls <- byOperation submPollsByOperation "Sentinel"
+          osStop
+          pure (intervals, polls)
+        -- Only what does not depend on how fast the machine is: the count against the polls, and a
+        -- time between polls of at least the refetch interval.
+        let observed = maybe 0 histCount intervals
+        it "each poll after the first observes the time since the previous one started" $ do
+          -- One fewer than the polls, or as many if the poller was stopped in a poll it had
+          -- just started.
+          observed `shouldSatisfy` (`elem` [max 0 (round polls - 1), round polls])
+          observed `shouldSatisfy` (> 0)
+        it "the time between polls is at least the refetch interval" $ do
+          let mean = maybe 0 (\h -> histSum h / fromIntegral (histCount h)) intervals
+          mean `shouldSatisfy` (>= 0.2)
+
       describe "a live query poll" $ do
         -- Two subscribers of LiveOp in one cohort of a live query poller, whose thread is stopped,
         -- and one poll run here. They are added with other metrics than the poll, so that the
         -- first poll of the poller's own thread, before it is stopped, is not counted.
-        (polls, cohorts, served, activeCohorts) <- runIO do
+        (polls, cohorts, served, activeCohorts, intervals) <- runIO do
           subscriptionState <- initSubscriptionsState (const (pure ()))
           promMetrics <- makeDummyPrometheusMetrics
           wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
           cohortId <- newCohortId
           let quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
               options = mkSubscriptionsOptions Nothing Nothing
+              -- Keep the real poller parked; this test invokes its poll function explicitly.
+              getOptions = forever (threadDelay maxBound)
               liveQuery =
                 [PG.sql|
                   SELECT "_subs"."result_id", json_build_object('numbers', (SELECT coalesce(json_agg("id" ORDER BY "id"), '[]') FROM "public"."numbers"))::text AS "result"
@@ -1055,7 +1086,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                   dummyPromMetrics
                   (mkSubscriberMetadata wsId (unsafeMkOperationId name) Nothing (RequestId name))
                   subscriptionState
-                  (pure (options, options))
+                  getOptions
                   SNDefault
                   paramQueryHash
                   (op "LiveOp")
@@ -1072,34 +1103,41 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
           Immortal.stop (_pThread ioState)
           registerPollerByOperation promMetrics (unPollerId (_pId ioState))
-          pollLiveQuery
-            @('Postgres 'Vanilla)
-            (_pId ioState)
-            (_pPollerState poller)
-            options
-            (SNDefault, srcConfig)
-            (mkRoleNameE "user")
-            paramQueryHash
-            (MultiplexedQuery liveQuery)
-            (_pCohorts poller)
-            (const $ pure ())
-            promMetrics
-            (pure GranularMetricsOff)
-            (_pOperationNamesMap poller)
-            Nothing
-            Nothing
-            quietLogger
-            []
-            (pure ModelInfoLogOff)
+          let runPoll =
+                pollLiveQuery
+                  @('Postgres 'Vanilla)
+                  (_pId ioState)
+                  (_pPollerState poller)
+                  options
+                  (SNDefault, srcConfig)
+                  (mkRoleNameE "user")
+                  paramQueryHash
+                  (MultiplexedQuery liveQuery)
+                  (_pCohorts poller)
+                  (const $ pure ())
+                  promMetrics
+                  (pure GranularMetricsOff)
+                  (_pOperationNamesMap poller)
+                  Nothing
+                  Nothing
+                  quietLogger
+                  []
+                  (pure ModelInfoLogOff)
+          previousPollStart <- newIORef Nothing
+          observePollStart promMetrics liveQuerySubscriptionLabel previousPollStart
+          runPoll
+          observePollStart promMetrics liveQuerySubscriptionLabel previousPollStart
+          runPoll
           let SubscriptionMetrics {..} = pmSubscriptionMetrics promMetrics
               liveOp = SubscriptionLabel liveQuerySubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel "LiveOp")))
-          (,,,)
+          (,,,,)
             <$> (Map.findWithDefault 0 liveOp <$> CounterVector.read submPollsByOperation)
             <*> (Map.findWithDefault 0 liveOp <$> CounterVector.read submCohortsProcessedByOperation)
             <*> (Map.findWithDefault 0 (SubscriptionChangedLabel liveOp True) <$> CounterVector.read submSubscribersServed)
             <*> (Map.findWithDefault 0 liveOp <$> GaugeVector.read submActiveCohortsByOperation)
+            <*> (maybe 0 histCount . Map.lookup liveQuerySubscriptionLabel <$> HistogramVector.read submPollInterval)
         it "records the poll, its cohort and the subscribers it served under the live query kind" $ do
-          (polls, cohorts, served, activeCohorts) `shouldBe` (1, 1, 2, 1)
+          (polls, cohorts, served, activeCohorts, intervals) `shouldBe` (2, 2, 2, 1, 1)
 
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId

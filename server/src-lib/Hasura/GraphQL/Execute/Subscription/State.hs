@@ -37,6 +37,7 @@ import Control.Immortal qualified as Immortal
 import Data.Aeson.Extended qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
+import Data.IORef (newIORef)
 import Data.Monoid (Endo)
 import Data.String
 import Data.Text.Extended
@@ -67,6 +68,7 @@ import Hasura.Server.Prometheus
     SubscriptionMetrics (..),
     forgetPollerByOperation,
     liveQuerySubscriptionLabel,
+    observePollStart,
     registerPollerByOperation,
     streamingSubscriptionLabel,
     subscriptionLabel,
@@ -255,9 +257,11 @@ addLiveQuery
     -- cancelled after putTMVar
     for_ pollerMaybe $ \poller -> do
       registerPollerByOperation prometheusMetrics (unPollerId pollerId)
+      previousPollStart <- newIORef Nothing
       threadRef <- forkImmortal ("pollLiveQuery." <> show pollerId) logger
         $ forever
         $ do
+          observePollStart prometheusMetrics liveQuerySubscriptionLabel previousPollStart
           (lqOpts, _) <- getSubscriptionOptions
           let SubscriptionsOptions _ refetchInterval = lqOpts
           pollLiveQuery @b
@@ -379,9 +383,11 @@ addStreamSubscriptionQuery
     -- cancelled after putTMVar
     for_ handlerM $ \handler -> do
       registerPollerByOperation prometheusMetrics (unPollerId pollerId)
+      previousPollStart <- newIORef Nothing
       threadRef <- forkImmortal ("pollStreamingQuery." <> show (unPollerId pollerId)) logger
         $ forever
         $ do
+          observePollStart prometheusMetrics streamingSubscriptionLabel previousPollStart
           (_, streamQOpts) <- getSubscriptionOptions
           let SubscriptionsOptions _ refetchInterval = streamQOpts
           pollStreamingQuery @b
