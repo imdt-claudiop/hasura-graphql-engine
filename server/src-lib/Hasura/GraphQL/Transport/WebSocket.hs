@@ -1,7 +1,9 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- guards subscription pushes with a per-operation liveness flag instead of an opMap lookup,
 -- so the first live query result is not dropped when the poller runs before the operation
--- is registered (https://github.com/hasura/graphql-engine/issues/10952). See BBB-CHANGES.md.
+-- is registered (https://github.com/hasura/graphql-engine/issues/10952); labels the GraphQL
+-- subscription series, poller operation-name map, opMap, subscriber metadata, and websocket
+-- byte labels by resolved operation name, always, without the query hash. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | This file contains the handlers that are used within websocket server.
@@ -737,7 +739,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
                 let asyncActionQueryLive =
                       ES.LAAQOnSourceDB
                         $ ES.LiveAsyncActionQueryOnSource lqId actionLogMap
-                        $ restartLiveQuery opName parameterizedQueryHash requestId liveQueryBuilder granularPrometheusMetricsState (_grOperationName reqParsed) modifier modelInfoLogStatus''
+                        $ restartLiveQuery opName parameterizedQueryHash requestId liveQueryBuilder granularPrometheusMetricsState opName modifier modelInfoLogStatus''
 
                     onUnexpectedException err = do
                       sendError requestId err
@@ -750,14 +752,13 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
                   asyncActionQueryLive
         E.SEOnSourceDB (E.SSStreaming rootFieldName streamQueryBuilder) -> do
           modelInfoLogStatus'' <- runGetModelInfoLogStatus
-          liftIO $ startStreamingQuery rootFieldName streamQueryBuilder parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus''
+          liftIO $ startStreamingQuery opName rootFieldName streamQueryBuilder parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus''
 
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         (Just G.OperationTypeSubscription)
         Success
         opName
-        (Just parameterizedQueryHash)
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
       liftIO $ logOpEv ODStarted (Just requestId) (Just parameterizedQueryHash)
   where
@@ -944,19 +945,19 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
             ERTGraphqlCompliant -> fmtErrorMessage [errFn HideInternalErrors qErr]
       sendControlMsg wsConn (SMErr $ ErrorMsg opId err)
 
-    -- | Sends subscription-result data -- the only messages subject to the
+    -- \| Sends subscription-result data -- the only messages subject to the
     -- connection's send-queue capacity. If the queue is at capacity, this
     -- doesn't enqueue the data at all; instead it cancels the operation via
     -- 'cancelOperationOnOvercapacity'.
     sendMsgWithMetadata ::
       (MonadIO n) =>
-      -- | Whether this operation is a live query or streaming subscription
+      -- \| Whether this operation is a live query or streaming subscription
       -- (as opposed to a one-shot query/mutation). Determines whether
       -- 'cancelOperationOnOvercapacity' needs to tear down a poller and
       -- guard against a dangling/straggler poll re-notifying an
       -- already-cancelled operation -- see its haddock.
       Bool ->
-      -- | For a streaming subscription's data push: the cursor value in
+      -- \| For a streaming subscription's data push: the cursor value in
       -- effect just before the poll that produced it -- see
       -- 'WS._wseiStreamingResumeCursor'. 'Nothing' for everything else.
       Maybe ES.CursorVariableValues ->
@@ -989,7 +990,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
                 WS._wseiStreamingResumeCursor = J.toJSON <$> resumeCursor
               }
 
-    -- | Called when 'sendMsgWithMetadata' fails to enqueue this operation's
+    -- \| Called when 'sendMsgWithMetadata' fails to enqueue this operation's
     -- data because the connection's send queue is at capacity. Tears the
     -- operation down if it's a live query or streaming subscription (a
     -- one-shot query/mutation has no poller to tear down -- it's simply
@@ -1013,7 +1014,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
     -- 'onChange'. To avoid re-notifying (a spurious second error+complete)
     -- for that dangling/straggler call, 'claimAndStopSubscription' does the
     -- lookup-and-delete as a single atomic transaction and reports whether
-    -- *this* call was the one that found (and removed) the entry --
+    -- \*this* call was the one that found (and removed) the entry --
     -- notification only happens then, making this a no-op for the
     -- straggler's call (or for a concurrent 'stopOperation'/'onClose'). A
     -- one-shot query/mutation is never tracked in 'opMap' at all (no
@@ -1129,9 +1130,8 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
           STMMap.insert (LiveQuerySubscriber lqId, opName, opLive) opId opMap
         pure lqId
 
-    startStreamingQuery rootFieldName ((sourceName, E.SubscriptionQueryPlan exists), modelInfo) parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus = do
-      let !opName = _grOperationName q
-          subscriberMetadata = ES.mkSubscriberMetadata (WS.getWSId wsConn) opId opName requestId
+    startStreamingQuery opName rootFieldName ((sourceName, E.SubscriptionQueryPlan exists), modelInfo) parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus = do
+      let subscriberMetadata = ES.mkSubscriberMetadata (WS.getWSId wsConn) opId opName requestId
       -- See the matching note in 'startLiveQuery': the liveness flag must
       -- exist before the subscriber is visible to a poller.
       opLive <- liftIO $ STM.newTVarIO True
@@ -1210,24 +1210,22 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
     catchAndIgnore m = void $ runExceptT m
 
     reportGQLQueryError :: IO GranularPrometheusMetricsState -> Maybe OperationName -> Maybe ParameterizedQueryHash -> Maybe G.OperationType -> IO ()
-    reportGQLQueryError granularPrometheusMetricsState mOpName mQHash mOpType =
+    reportGQLQueryError _granularPrometheusMetricsState mOpName _mQHash mOpType =
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         mOpType
         Failed
         mOpName
-        mQHash
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
 
     -- Tally and record execution times for successful GraphQL requests.
     recordGQLQuerySuccess :: IO GranularPrometheusMetricsState -> DiffTime -> Maybe OperationName -> ParameterizedQueryHash -> G.OperationType -> IO ()
-    recordGQLQuerySuccess granularPrometheusMetricsState totalTime mOpName qHash opType = do
+    recordGQLQuerySuccess _granularPrometheusMetricsState totalTime mOpName _qHash opType = do
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         (Just opType)
         Success
         mOpName
-        (Just qHash)
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
       case opType of
         G.OperationTypeQuery -> liftIO $ Prometheus.Histogram.observe (gqlExecutionTimeSecondsQuery gqlMetrics) (realToFrac totalTime)
@@ -1466,7 +1464,8 @@ onClose logger serverMetrics prometheusMetrics subscriptionsState wsConn granula
   opIds <- liftIO $ STM.atomically $ map fst <$> ListT.toList (STMMap.listT opMap)
   liftIO
     $ for_ opIds
-    $ void . claimAndStopSubscription logger serverMetrics prometheusMetrics subscriptionsState wsConn granularPrometheusMetricsState
+    $ void
+    . claimAndStopSubscription logger serverMetrics prometheusMetrics subscriptionsState wsConn granularPrometheusMetricsState
   where
     opMap = _wscOpMap $ WS.getData wsConn
 

@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- labels the websocket bytes sent by operation name, always, without the query hash. See BBB-CHANGES.md.
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -76,11 +78,11 @@ import Hasura.Server.Init.Config (AllowListStatus (..), WSConnectionInitTimeout 
 import Hasura.Server.Prometheus
   ( DynamicGraphqlOperationLabel (..),
     PrometheusMetrics (..),
-    recordMetricWithLabel,
+    operationNameLabel,
     pmWebsocketMsgDropped,
     pmWebsocketMsgQueued,
   )
-import Hasura.Server.Types (ExperimentalFeature (..), MonadGetPolicies (runGetPrometheusMetricsGranularity))
+import Hasura.Server.Types (ExperimentalFeature (..))
 import ListT qualified
 import Network.Wai.Extended (IpAddress)
 import Network.Wai.Handler.Warp qualified as Warp
@@ -283,7 +285,7 @@ sendMsgAndCloseConn wsConn errCode bs serverErr = do
 -- since a client waiting on data that will now never arrive is worse than
 -- one told explicitly to retry.
 sendMsg :: WSConn a -> WSQueueResponse -> IO Bool
-sendMsg WSConn{_wcMainQ, _wcMainQCount, _wcMainQCapacity, _wcPrometheusMetrics} !resp = do
+sendMsg WSConn {_wcMainQ, _wcMainQCount, _wcMainQCapacity, _wcPrometheusMetrics} !resp = do
   $assertNFHere resp -- so we don't write thunks to mutable vars
   accepted <- STM.atomically $ do
     count <- STM.readTVar _wcMainQCount
@@ -304,7 +306,7 @@ sendMsg WSConn{_wcMainQ, _wcMainQCount, _wcMainQCapacity, _wcPrometheusMetrics} 
 -- small and bounded in number (at most a handful per operation lifecycle),
 -- unlike the data traffic 'sendMsg' guards.
 sendMsgUnconditional :: WSConn a -> WSQueueResponse -> IO ()
-sendMsgUnconditional WSConn{_wcMainQ, _wcMainQCount, _wcPrometheusMetrics} !resp = do
+sendMsgUnconditional WSConn {_wcMainQ, _wcMainQCount, _wcPrometheusMetrics} !resp = do
   $assertNFHere resp -- so we don't write thunks to mutable vars
   STM.atomically $ do
     STM.writeTQueue _wcMainQ resp
@@ -318,7 +320,7 @@ sendMsgUnconditional WSConn{_wcMainQ, _wcMainQCount, _wcPrometheusMetrics} !resp
 -- second one -- they're fully interchangeable, so only the latest is ever
 -- worth keeping.
 sendMsgKeepAlive :: WSConn a -> WSQueueResponse -> IO ()
-sendMsgKeepAlive WSConn{_wcKeepAliveSlot} !resp = do
+sendMsgKeepAlive WSConn {_wcKeepAliveSlot} !resp = do
   $assertNFHere resp -- so we don't write thunks to mutable vars
   STM.atomically $ STM.writeTMVar _wcKeepAliveSlot resp
 
@@ -584,7 +586,7 @@ websocketConnectionReaper getLatestConfig getSchemaCache ws@(WSServer _ userConf
 
 -- | This is called for each client websocket connection
 createServerApp ::
-  (MonadIO m, MC.MonadBaseControl IO m, LA.Forall (LA.Pure m), MonadWSLog m, MonadGetPolicies m) =>
+  (MonadIO m, MC.MonadBaseControl IO m, LA.Forall (LA.Pure m), MonadWSLog m) =>
   IO MetricsConfig ->
   WSConnectionInitTimeout ->
   Refined Positive Int ->
@@ -755,18 +757,11 @@ createServerApp getMetricsConfig wsConnInitTimeout wsQueueSize (WSServer logger@
                     (messageWriteTime, _) <- liftIO $ withElapsedTime $ WS.sendTextData conn msg
                     let messageLength = BL.length msg
                         messageDetails = MessageDetails (SB.fromLBS msg) messageLength
-                        parameterizedQueryHash = wsInfo >>= _wseiParameterizedQueryHash
-                        operationName = wsInfo >>= _wseiOperationName
-                        promMetricGranularLabel = DynamicGraphqlOperationLabel parameterizedQueryHash operationName
-                        promMetricLabel = DynamicGraphqlOperationLabel Nothing Nothing
                         websocketBytesSentMetric = pmWebSocketBytesSent prometheusMetrics
-                    granularPrometheusMetricsState <- runGetPrometheusMetricsGranularity
                     liftIO $ do
-                      recordMetricWithLabel
-                        granularPrometheusMetricsState
-                        True
-                        (CounterVector.add websocketBytesSentMetric promMetricGranularLabel messageLength)
-                        (CounterVector.add websocketBytesSentMetric promMetricLabel messageLength)
+                      -- A message of an operation is labeled with the operation's name.
+                      label <- for wsInfo \info -> DynamicGraphqlOperationLabel <$> operationNameLabel prometheusMetrics (_wseiOperationName info)
+                      CounterVector.add websocketBytesSentMetric label messageLength
                       Prometheus.Histogram.observe
                         (pmWebsocketMsgQueueTimeSeconds prometheusMetrics)
                         messageQueueTime
