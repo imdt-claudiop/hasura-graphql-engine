@@ -1,9 +1,9 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- removeStreamingQuery decrements the poller's operation name count and the active
 -- subscriptions gauge once per removed subscriber instead of once per cohort; the active
--- subscriptions gauge is labeled by operation name, always, without the query hash; a
--- removed poller takes its share of the per-operation cohorts gauge out. See BBB-
--- CHANGES.md.
+-- subscriptions gauge is labeled by operation name, always, without the query hash; it keeps
+-- the gauge of the pollers serving each operation, and a removed poller takes its share of the
+-- per-operation cohorts gauge out. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | Top-level management of subscription poller threads.
@@ -62,6 +62,8 @@ import Hasura.SQL.AnyBackend qualified as AB
 import Hasura.Server.Metrics (ServerMetrics (..))
 import Hasura.Server.Prometheus
   ( PrometheusMetrics (..),
+    SubscriptionKindLabel,
+    SubscriptionLabel,
     SubscriptionMetrics (..),
     forgetPollerByOperation,
     liveQuerySubscriptionLabel,
@@ -133,7 +135,8 @@ findPollerForSubscriber ::
   PollerId ->
   ParameterizedQueryHash ->
   Maybe OperationName ->
-  STM.STM (Maybe (Poller streamCursorVars))
+  -- | the poller, when it is newly created, and whether the operation is new to the poller
+  STM.STM (Maybe (Poller streamCursorVars), Bool)
 findPollerForSubscriber subscriber pollerMap pollerKey cohortKey addToCohort addToPoller pollerId parameterizedQueryHash maybeOperationName =
   -- a handler is returned only when it is newly created
   STMMap.lookup pollerKey pollerMap >>= \case
@@ -146,12 +149,8 @@ findPollerForSubscriber subscriber pollerMap pollerKey cohortKey addToCohort add
           -- cohort not found. Create a cohort with the subscriber and add
           -- the cohort to the poller
           Nothing -> addToPoller subscriber poller
-      -- Add the operation name of the subcription to the poller, if it doesn't exist
-      -- else increment the count for the operation name
-      TMap.lookup maybeOperationName (_pOperationNamesMap poller) >>= \case
-        Nothing -> TMap.insert 1 maybeOperationName (_pOperationNamesMap poller)
-        Just _ -> TMap.adjust (+ 1) maybeOperationName (_pOperationNamesMap poller)
-      return Nothing
+      operationEntered <- enterOperationName maybeOperationName (_pOperationNamesMap poller)
+      return (Nothing, operationEntered)
     Nothing -> do
       -- no poller found, so create one with the cohort
       -- and the subscriber within it.
@@ -160,7 +159,36 @@ findPollerForSubscriber subscriber pollerMap pollerKey cohortKey addToCohort add
       !poller <- Poller <$> TMap.new <*> STM.newTVar PRSSuccess <*> STM.newEmptyTMVar <*> pure pollerId <*> pure parameterizedQueryHash <*> pure operationNamesMap
       _ <- addToPoller subscriber poller
       STMMap.insert poller pollerKey pollerMap
-      return (Just poller)
+      return (Just poller, True)
+
+-- | Adds the operation name of the subscription to the poller, if it doesn't exist, else
+-- increments the count for the operation name. True when the poller did not serve the
+-- operation before.
+enterOperationName :: Maybe OperationName -> TMap.TMap (Maybe OperationName) Int -> STM.STM Bool
+enterOperationName maybeOperationName operationNamesMap =
+  TMap.lookup maybeOperationName operationNamesMap >>= \case
+    Nothing -> TMap.insert 1 maybeOperationName operationNamesMap $> True
+    Just _ -> TMap.adjust (+ 1) maybeOperationName operationNamesMap $> False
+
+-- | Counts down a subscriber of the operation in the poller. True when it was the operation's
+-- last subscriber in the poller.
+leaveOperationName :: Maybe OperationName -> TMap.TMap (Maybe OperationName) Int -> STM.STM Bool
+leaveOperationName maybeOperationName operationNamesMap =
+  TMap.lookup maybeOperationName operationNamesMap >>= \case
+    -- If only one operation name is present in the map, delete it
+    Just 1 -> TMap.delete maybeOperationName operationNamesMap $> True
+    -- If the count of a operation name is more than 1, then it means there
+    -- are more subscriptions with the same name and we should keep emitting
+    -- the metrics until the all the subscription with that operaion name are
+    -- removed
+    Just _ -> TMap.adjust (\v -> v - 1) maybeOperationName operationNamesMap $> False
+    Nothing -> pure False
+
+-- | Counts a poller in or out of the pollers serving an operation.
+countPollerOfOperation :: PrometheusMetrics -> SubscriptionKindLabel -> Maybe OperationName -> (GaugeVector.GaugeVector SubscriptionLabel -> SubscriptionLabel -> IO ()) -> IO ()
+countPollerOfOperation prometheusMetrics kind maybeOperationName change =
+  subscriptionLabel prometheusMetrics kind maybeOperationName
+    >>= change (submActivePollersByOperation $ pmSubscriptionMetrics prometheusMetrics)
 
 -- | Fork a thread handling a regular (live query) subscription
 addLiveQuery ::
@@ -210,7 +238,7 @@ addLiveQuery
 
     $assertNFHere subscriber -- so we don't write thunks to mutable vars
     pollerId <- PollerId <$> UUID.nextRandom
-    pollerMaybe <-
+    (pollerMaybe, operationEntered) <-
       STM.atomically
         $ findPollerForSubscriber
           subscriber
@@ -260,6 +288,7 @@ addLiveQuery
     liftIO
       $ subscriptionLabel prometheusMetrics liveQuerySubscriptionLabel operationName
       >>= GaugeVector.inc (submActiveSubscriptions $ pmSubscriptionMetrics prometheusMetrics)
+    when operationEntered $ countPollerOfOperation prometheusMetrics liveQuerySubscriptionLabel operationName GaugeVector.inc
     liftIO $ EKG.Gauge.inc $ smActiveLiveQueries serverMetrics
 
     pure $ SubscriberDetails handlerId cohortKey subscriberId
@@ -333,7 +362,7 @@ addStreamSubscriptionQuery
 
     $assertNFHere subscriber -- so we don't write thunks to mutable vars
     pollerId <- PollerId <$> UUID.nextRandom
-    handlerM <-
+    (handlerM, operationEntered) <-
       STM.atomically
         $ findPollerForSubscriber
           subscriber
@@ -388,6 +417,7 @@ addStreamSubscriptionQuery
     liftIO
       $ subscriptionLabel prometheusMetrics streamingSubscriptionLabel operationName
       >>= GaugeVector.inc (submActiveSubscriptions $ pmSubscriptionMetrics prometheusMetrics)
+    when operationEntered $ countPollerOfOperation prometheusMetrics streamingSubscriptionLabel operationName GaugeVector.inc
 
     pure $ SubscriberDetails handlerId cohortKey subscriberId
     where
@@ -428,14 +458,10 @@ removeLiveQuery logger serverMetrics prometheusMetrics lqState lqId@(SubscriberD
           Nothing -> return (pure False)
           Just (Poller cohorts pollerState ioState pollerId _ operationNamesMap, cohort) -> do
             subscriberInPoller <- isSubscriberOf sinkId cohort
-            when subscriberInPoller
-              $ TMap.lookup maybeOperationName operationNamesMap
-              >>= \case
-                Just 1 -> TMap.delete maybeOperationName operationNamesMap
-                Just _ -> TMap.adjust (\v -> v - 1) maybeOperationName operationNamesMap
-                Nothing -> return ()
+            operationLeft <- if subscriberInPoller then leaveOperationName maybeOperationName operationNamesMap else pure False
             cleanAction <- cleanHandlerC cohorts pollerState ioState pollerId cohort subscriberInPoller
-            return (cleanAction >> pure subscriberInPoller)
+            let countPollerDown = when operationLeft $ countPollerOfOperation prometheusMetrics liveQuerySubscriptionLabel maybeOperationName GaugeVector.dec
+            return (cleanAction >> countPollerDown >> pure subscriberInPoller)
   when subscriberFound $ liftIO $ do
     EKG.Gauge.dec $ smActiveSubscriptions serverMetrics
     EKG.Gauge.dec $ smActiveLiveQueries serverMetrics
@@ -443,9 +469,7 @@ removeLiveQuery logger serverMetrics prometheusMetrics lqState lqId@(SubscriberD
     lqMap = _ssLiveQueryMap lqState
 
     isSubscriberOf subscriberId cohort =
-      (||)
-        <$> (isJust <$> TMap.lookup subscriberId (_cExistingSubscribers cohort))
-        <*> (isJust <$> TMap.lookup subscriberId (_cNewSubscribers cohort))
+      (||) <$> (isJust <$> TMap.lookup subscriberId (_cExistingSubscribers cohort)) <*> (isJust <$> TMap.lookup subscriberId (_cNewSubscribers cohort))
 
     getQueryDet subMap = do
       pollerM <- STMMap.lookup handlerId subMap
@@ -531,17 +555,10 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
             -- until they merge again (see the cohort map rebuild in pollStreamingQuery); its
             -- operation name is counted down once if it is in any of them.
             subscriberInPoller <- or <$> for allCohorts (isSubscriberOf sinkId)
-            when subscriberInPoller
-              $ TMap.lookup maybeOperationName operationNamesMap
-              >>= \case
-                -- If only one operation name is present in the map, delete it
-                Just 1 -> TMap.delete maybeOperationName operationNamesMap
-                -- If the count of a operation name is more than 1, then it means there
-                -- are more subscriptions with the same name and we should keep emitting
-                -- the metrics until the all the subscription with the operaion name are
-                -- removed
-                Just _ -> TMap.adjust (\v -> v - 1) maybeOperationName operationNamesMap
-                Nothing -> return ()
+            operationLeft <-
+              if subscriberInPoller
+                then leaveOperationName maybeOperationName operationNamesMap
+                else pure False
 
             actions <- for allCohorts \cohort ->
               cleanHandlerC cohorts pollerState ioState pollerId cohort
@@ -550,7 +567,8 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
                   when subscriberInPoller
                     $ subscriptionLabel prometheusMetrics streamingSubscriptionLabel maybeOperationName
                     >>= GaugeVector.dec (submActiveSubscriptions $ pmSubscriptionMetrics prometheusMetrics)
-            pure (mconcat actions >> countActiveDown >> pure subscriberInPoller)
+                countPollerDown = when operationLeft $ countPollerOfOperation prometheusMetrics streamingSubscriptionLabel maybeOperationName GaugeVector.dec
+            pure (mconcat actions >> countActiveDown >> countPollerDown >> pure subscriberInPoller)
   when subscriberFound $ liftIO $ do
     EKG.Gauge.dec $ smActiveSubscriptions serverMetrics
     EKG.Gauge.dec $ smActiveStreamingSubscriptions serverMetrics

@@ -305,6 +305,13 @@ always on.
     when it is created and forgotten when it is removed, including the defensive path where
     its worker state was not installed. A poll that ends after removal (its thread is stopped,
     not awaited) changes nothing.
+  - `hasura_active_subscription_pollers_by_operation` counts each poller once for each operation
+    it serves: +1 when the operation's first subscriber enters the poller (or creates it), -1
+    when its last one leaves, as the poller's map of operation names changes. Two names that
+    both become `(other)` count the poller once each. The change is applied after the
+    transaction, and an operation's -1 always follows its +1: a subscription can only be
+    removed once `addLiveQuery` or `addStreamSubscriptionQuery`, which applies the +1, has
+    returned.
 
 ## Formatting
 

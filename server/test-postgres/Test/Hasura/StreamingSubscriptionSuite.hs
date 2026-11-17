@@ -728,6 +728,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                 (mkCohortVariables mempty mempty mempty mempty mempty)
                 Nothing
             activeSubscriptions = sum . Map.elems <$> GaugeVector.read (submActiveSubscriptions $ pmSubscriptionMetrics promMetrics)
+            activePollers = sum . Map.elems <$> GaugeVector.read (submActivePollersByOperation $ pmSubscriptionMetrics promMetrics)
             operationNameCount poller = STM.atomically $ TMap.lookup operationName (_pOperationNamesMap poller)
             pollerIsReported poller = HashMap.member (unPollerId (_pPollerId poller)) <$> readIORef (submReportedCohorts $ pmSubscriptionMetrics promMetrics)
         let joinLive name =
@@ -755,8 +756,9 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         ioState <- STM.atomically (STM.takeTMVar (_pIOState poller))
         Immortal.stop (_pThread ioState)
         let snapshot =
-              (,,,,)
+              (,,,,,)
                 <$> activeSubscriptions
+                <*> activePollers
                 <*> operationNameCount poller
                 <*> EKG.Gauge.read (smActiveSubscriptions serverMetrics)
                 <*> EKG.Gauge.read (smActiveLiveQueries serverMetrics)
@@ -772,10 +774,10 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
 
       it "keeps every count unchanged on double removal and counts every metric down when the last subscriber has no installed thread" $ do
         let (before, afterFirst, afterSecond, afterLast) = activeBeforeAndAfter
-        before `shouldSatisfy` \(active, names, _, _, reported) -> (active, names, reported) == (2, Just 2, True)
-        afterFirst `shouldSatisfy` \(active, names, _, _, reported) -> (active, names, reported) == (1, Just 1, True)
+        before `shouldSatisfy` \(active, pollers, names, _, _, reported) -> (active, pollers, names, reported) == (2, 1, Just 2, True)
+        afterFirst `shouldSatisfy` \(active, pollers, names, _, _, reported) -> (active, pollers, names, reported) == (1, 1, Just 1, True)
         afterSecond `shouldBe` afterFirst
-        afterLast `shouldBe` (0, Nothing, 0, 0, False)
+        afterLast `shouldBe` (0, 0, Nothing, 0, 0, False)
 
     describe "Per-operation subscription metrics" $ do
       let -- A poller whose only polls are the ones a test runs: a sentinel subscriber, on a
@@ -787,7 +789,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
             wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
             received <- newIORef ([] :: [(Text, Int)])
             let subOptions = mkSubscriptionsOptions Nothing Nothing
-                -- The poller stays parked before its first poll until the test stops it.
+                -- Keep the real poller parked; tests invoke its poll function explicitly.
                 getOptions = forever (threadDelay maxBound)
                 quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
                 plan cohortId cursor =
@@ -917,6 +919,30 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           afterLeaving `shouldBe` ([5, 3, 5], [2, 0, 2])
         it "removing the poller takes its cohorts out of the gauge" $ do
           afterRemoval `shouldBe` ([5, 3, 5], [0, 0, 0])
+
+      describe "pollers serving an operation" $ do
+        -- First and Second share the poller with the sentinel.
+        steps <- runIO do
+          OpScenario {..} <- newOpScenario
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              gaugeOf name = Map.findWithDefault 0 (SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) <$> GaugeVector.read submActivePollersByOperation
+              snapshot = traverse gaugeOf ["First", "Second", "Sentinel"]
+          a <- osJoin (op "First") "a" 1
+          b <- osJoin (op "First") "b" 2
+          joined <- snapshot
+          c <- osJoin (op "Second") "c" 1
+          withSecond <- snapshot
+          osLeave (op "First") a
+          oneOfFirstLeft <- snapshot
+          osLeave (op "First") b
+          firstLeft <- snapshot
+          osLeave (op "Second") c
+          osLeave (op "Sentinel") osSentinel
+          removed <- snapshot
+          osStop
+          pure [joined, withSecond, oneOfFirstLeft, firstLeft, removed]
+        it "an operation counts the poller once, from its first subscriber in it to its last" $ do
+          steps `shouldBe` [[1, 0, 1], [1, 1, 1], [1, 1, 1], [0, 1, 1], [0, 0, 0]]
 
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId
