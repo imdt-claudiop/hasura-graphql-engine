@@ -17,10 +17,12 @@ import Control.Exception (evaluate)
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
 import Data.HashMap.Strict qualified as HashMap
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.HashSet qualified as HashSet
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.IO qualified as TextIO
 import Data.UUID qualified as UUID
 import Database.PG.Query qualified as PG
 import GHC.AssertNF (isNF)
@@ -30,6 +32,8 @@ import Hasura.RQL.Types.Common (defaultSource)
 import Hasura.Server.Prometheus
 import Language.GraphQL.Draft.Syntax qualified as G
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
+import System.Directory (removeFile)
+import System.IO (hClose, openTempFile)
 import System.Metrics.Prometheus qualified as Prometheus
 import System.Metrics.Prometheus.CounterVector qualified as CounterVector
 import System.Metrics.Prometheus.Export qualified as PromExport
@@ -270,6 +274,31 @@ operationNameLabelSpec = describe "operationNameLabel" $ do
           pure $ length $ filter (/= otherOperationLabel) labels
     admitted 5 10 `shouldReturn` 5
     admitted 10000 10001 `shouldReturn` 10000
+
+  it "keeps reserved names after the limit is exhausted without consuming a slot" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetricsWithOperationNames 1 (HashSet.singleton "reserved") store
+    operationNameLabel metrics (opName "ordinary") `shouldReturn` OperationNameLabel "ordinary"
+    operationNameLabel metrics (opName "late") `shouldReturn` otherOperationLabel
+    operationNameLabel metrics (opName "reserved") `shouldReturn` OperationNameLabel "reserved"
+
+  it "uses no reserved names when the file option is absent or its file is missing" $ do
+    warnings <- newIORef []
+    absent <- readOperationNamesFile (modifyIORef' warnings . (:)) Nothing
+    missing <- readOperationNamesFile (modifyIORef' warnings . (:)) (Just "/tmp/hasura-operation-names-file-that-does-not-exist")
+    messages <- readIORef warnings
+    (absent, missing) `shouldBe` (mempty, mempty)
+    messages `shouldSatisfy` any ("Could not read metrics operation names file" `T.isPrefixOf`)
+
+  it "reads valid names and warns about invalid lines" $ do
+    (path, handle) <- openTempFile "/tmp" "hasura-operation-names"
+    hClose handle
+    TextIO.writeFile path "# known clients\n\ngetUsers\nnot-valid\n_128_is_valid\n"
+    warnings <- newIORef []
+    names <- readOperationNamesFile (modifyIORef' warnings . (:)) (Just path)
+    removeFile path
+    names `shouldBe` HashSet.fromList ["getUsers", "_128_is_valid"]
+    readIORef warnings `shouldReturn` ["Ignoring invalid operation name on line 4 of " <> T.pack path <> ": not-valid"]
 
   it "counts two names past the cap in one poller as one (other), with their subscribers added" $ do
     metrics <- makeDummyPrometheusMetrics

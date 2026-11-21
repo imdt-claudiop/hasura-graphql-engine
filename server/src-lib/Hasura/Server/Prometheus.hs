@@ -5,6 +5,7 @@
 -- metrics, used by the GET /v1/metrics endpoint; observes a subscription poll once, by
 -- subscription kind; labels operations by their capped name, always, without the query
 -- hash, up to a configurable number of names; adds the per-operation subscription metrics;
+-- reserves configured operation names outside that limit;
 -- sets the buckets of the subscription poll times; says in the help of the subscription
 -- database time that the pool wait is left out; describes what a full websocket send queue
 -- does in the help of its counter; adds the Postgres pool metrics and the pool observer that
@@ -22,6 +23,8 @@ module Hasura.Server.Prometheus
     PrometheusMetricsSpec,
     makePrometheusMetrics,
     makePrometheusMetricsWithOperationNameLimit,
+    makePrometheusMetricsWithOperationNames,
+    readOperationNamesFile,
     makeDummyPrometheusMetrics,
     ConnectionsGauge,
     Connections (..),
@@ -80,7 +83,7 @@ module Hasura.Server.Prometheus
   )
 where
 
-import Control.Exception (mask_)
+import Control.Exception (IOException, mask_, try)
 import Data.HashMap.Internal.Strict qualified as Map
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
@@ -89,6 +92,7 @@ import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
+import Data.Text.IO qualified as TextIO
 import Data.Time.Clock (diffTimeToPicoseconds)
 import Data.UUID (UUID)
 import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
@@ -127,6 +131,29 @@ import System.Metrics.Prometheus.Histogram (Histogram)
 import System.Metrics.Prometheus.Histogram qualified as Histogram
 import System.Metrics.Prometheus.HistogramVector (HistogramVector)
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
+
+--------------------------------------------------------------------------------
+
+-- | Read operation names reserved for metrics labels. Missing or unreadable files and invalid
+-- lines are warnings, not startup errors. The file is consumed once by the caller at startup.
+readOperationNamesFile :: (Text -> IO ()) -> Maybe FilePath -> IO (HashSet.HashSet Text)
+readOperationNamesFile _ Nothing = pure mempty
+readOperationNamesFile warn (Just path) = do
+  contents <- try @IOException (TextIO.readFile path)
+  case contents of
+    Left exception -> do
+      warn $ "Could not read metrics operation names file " <> T.pack path <> ": " <> tshow exception
+      pure mempty
+    Right text -> HashSet.fromList . catMaybes <$> traverse parseLine (zip [1 :: Int ..] (T.lines text))
+  where
+    parseLine (lineNumber, rawName)
+      | T.null name || "#" `T.isPrefixOf` name = pure Nothing
+      | T.compareLength name maxOperationNameLabelLength == GT || isNothing (G.mkName name) = do
+          warn $ "Ignoring invalid operation name on line " <> tshow lineNumber <> " of " <> T.pack path <> ": " <> name
+          pure Nothing
+      | otherwise = pure (Just name)
+      where
+        name = T.strip rawName
 
 --------------------------------------------------------------------------------
 
@@ -1261,7 +1288,13 @@ makePrometheusMetrics = makePrometheusMetricsWithOperationNameLimit defaultOpera
 
 -- | 'makePrometheusMetrics' with the number of distinct operation names admitted as label values.
 makePrometheusMetricsWithOperationNameLimit :: Int -> Store PrometheusMetricsSpec -> IO PrometheusMetrics
-makePrometheusMetricsWithOperationNameLimit pmOperationNameLimit store = do
+makePrometheusMetricsWithOperationNameLimit limit = makePrometheusMetricsWithOperationNames limit mempty
+
+-- | 'makePrometheusMetrics' with a limit for unreserved names and names that are admitted without
+-- consuming it. Starting the admitted set with the reserved names keeps the hot path to the same
+-- single in-memory set lookup as before.
+makePrometheusMetricsWithOperationNames :: Int -> HashSet.HashSet Text -> Store PrometheusMetricsSpec -> IO PrometheusMetrics
+makePrometheusMetricsWithOperationNames pmOperationNameLimit reservedOperationNames store = do
   pmConnections <- newConnectionsGauge
   registerPermanently store
     $ registerGroup
@@ -1287,7 +1320,7 @@ makePrometheusMetricsWithOperationNameLimit pmOperationNameLimit store = do
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
   pmPostgresPoolMetrics <- makePostgresPoolMetrics store
-  pmOperationNameLabels <- newIORef (mempty, 0)
+  pmOperationNameLabels <- newIORef (reservedOperationNames, 0)
   let pmSample = sampleAll store
   pure PrometheusMetrics {..}
 

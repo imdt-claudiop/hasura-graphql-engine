@@ -1,6 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- adds the metrics secret to the raw serve options and tests that a blank one counts as
--- not set; adds and tests the metrics operation name limit. See BBB-CHANGES.md.
+-- not set; adds and tests the operation-name metrics options. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 module Hasura.Server.InitSpec
@@ -123,7 +123,8 @@ emptyServeOptionsRaw =
       rsoRelayMode = UUT.RelayModeEnabled,
       rsoRemoteSchemaHealingInterval = Nothing,
       rsoMetricsSecret = Nothing,
-      rsoMetricsOperationNameLimit = Nothing
+      rsoMetricsOperationNameLimit = Nothing,
+      rsoMetricsOperationNamesFile = Nothing
     }
 
 mkServeOptionsSpec :: Hspec.Spec
@@ -372,6 +373,16 @@ mkServeOptionsSpec =
               result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
           fmap (unrefine . UUT.soMetricsOperationNameLimit) result
             `Hspec.shouldBe` Left "Fatal Error:- Environment variable HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT: Only expecting a positive integer"
+
+    Hspec.describe "soMetricsOperationNamesFile" $ do
+      Hspec.it "is absent by default" $ do
+        let result = UUT.runWithEnv [] (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsOperationNamesFile result `Hspec.shouldBe` Right Nothing
+
+      Hspec.it "reads the environment variable" $ do
+        let env = [(UUT._envVar UUT.metricsOperationNamesFileOption, "/etc/hasura/operation-names")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsOperationNamesFile result `Hspec.shouldBe` Right (Just "/etc/hasura/operation-names")
 
     Hspec.describe "soAuthHook" $ do
       Hspec.it "Default Hook Mode == GET" $ do

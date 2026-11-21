@@ -1,5 +1,5 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret and operation name limit defaults to the serve options. See
+-- adds the metrics secret, operation name limit and reserved-name file defaults. See
 -- BBB-CHANGES.md.
 {-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -352,6 +352,7 @@ serveOptions =
       soServerTimeout = Init._default Init.serverTimeoutOption,
       soMetricsSecret = Nothing,
       soMetricsOperationNameLimit = Init._default Init.metricsOperationNameLimitOption,
+      soMetricsOperationNamesFile = Nothing,
       soLogMaskedVariables = Set.empty,
       soRelayMode = Init.RelayModeEnabled,
       soRemoteSchemaHealingInterval = Init._default Init.remoteSchemaHealingIntervalOption

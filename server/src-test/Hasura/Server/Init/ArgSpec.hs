@@ -1,5 +1,5 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- tests the metrics operation name limit argument. See BBB-CHANGES.md.
+-- tests the operation-name metrics arguments. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -1502,6 +1502,14 @@ serveParserSpec =
         Opt.Success _result -> Hspec.expectationFailure "Should not parse successfully"
         Opt.Failure _pf -> pure ()
         Opt.CompletionInvoked cr -> Hspec.expectationFailure $ show cr
+
+    Hspec.it "It accepts '--metrics-operation-names-file'" $ do
+      let parserInfo = Opt.info (UUT.serveCommandParser @Logging.Hasura Opt.<**> Opt.helper) Opt.fullDesc
+          result = Opt.execParserPure Opt.defaultPrefs parserInfo ["--metrics-operation-names-file", "/etc/hasura/operation-names"]
+      fmap UUT.rsoMetricsOperationNamesFile result `Hspec.shouldSatisfy` \case
+        Opt.Success path -> path == Just "/etc/hasura/operation-names"
+        Opt.Failure _pf -> False
+        Opt.CompletionInvoked _cr -> False
 
     Hspec.it "It accepts '--events-fetch-interval'" $ do
       let -- Given

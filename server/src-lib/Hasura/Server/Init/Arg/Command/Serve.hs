@@ -1,6 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- adds the metrics secret option (HASURA_GRAPHQL_METRICS_SECRET) and the metrics operation name
--- limit option (HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT). See BBB-CHANGES.md.
+-- limit and reserved-name file options for operation-name metrics. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
@@ -91,6 +91,7 @@ module Hasura.Server.Init.Arg.Command.Serve
     remoteSchemaHealingIntervalOption,
     metricsSecretOption,
     metricsOperationNameLimitOption,
+    metricsOperationNamesFileOption,
 
     -- * Pretty Printer
     serveCmdFooter,
@@ -206,6 +207,7 @@ serveCommandParser =
     <*> parseRemoteSchemaHealingInterval
     <*> parseMetricsSecret
     <*> parseMetricsOperationNameLimit
+    <*> parseMetricsOperationNamesFile
 
 --------------------------------------------------------------------------------
 -- Serve Options
@@ -1778,7 +1780,8 @@ serveCmdFooter =
         Config.optionPP enableRelayOption,
         Config.optionPP remoteSchemaHealingIntervalOption,
         Config.optionPP metricsSecretOption,
-        Config.optionPP metricsOperationNameLimitOption
+        Config.optionPP metricsOperationNameLimitOption,
+        Config.optionPP metricsOperationNamesFileOption
       ]
     eventEnvs = [Config.optionPP graphqlEventsHttpPoolSizeOption, Config.optionPP graphqlEventsFetchIntervalOption]
 
@@ -1816,4 +1819,22 @@ metricsOperationNameLimitOption =
     { Config._default = $$(refineTH @Positive @Int 500),
       Config._envVar = "HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT",
       Config._helpMessage = "Max number of distinct operation names that become values of the operation_name label of the metrics; any other name is labeled (other). Read at start (default: 500; minimum: 1). bbb-graphql-middleware has the same cap, prometheus_operation_name_limit: if you change this, you probably also want to change it, so that the counts by name stay comparable. The option has no maximum: the memory held until a restart and the time and size of a scrape grow in proportion to the names admitted (with 10,000 names a scrape took about 2 s on a release build, against the default Prometheus scrape timeout of 10 s)"
+    }
+
+parseMetricsOperationNamesFile :: Opt.Parser (Maybe Text)
+parseMetricsOperationNamesFile =
+  Opt.optional
+    $ Opt.option
+      (Opt.eitherReader Env.fromEnv)
+      ( Opt.long "metrics-operation-names-file"
+          <> Opt.metavar (Config._envVar metricsOperationNamesFileOption)
+          <> Opt.help (Config._helpMessage metricsOperationNamesFileOption)
+      )
+
+metricsOperationNamesFileOption :: Config.Option ()
+metricsOperationNamesFileOption =
+  Config.Option
+    { Config._default = (),
+      Config._envVar = "HASURA_GRAPHQL_METRICS_OPERATION_NAMES_FILE",
+      Config._helpMessage = "File of operation names that always keep their own metrics label, so known clients are not displaced by the operation-name limit; one name per line, with blank lines and # comments ignored. Read once at start"
     }

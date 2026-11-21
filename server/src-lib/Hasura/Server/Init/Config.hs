@@ -1,5 +1,5 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret and the metrics operation name limit to the serve options. See
+-- adds the metrics secret, operation name limit and reserved operation names file to the serve options. See
 -- BBB-CHANGES.md.
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -370,7 +370,8 @@ data ServeOptionsRaw impl = ServeOptionsRaw
     rsoRelayMode :: RelayModeStatus,
     rsoRemoteSchemaHealingInterval :: Maybe OptionalInterval,
     rsoMetricsSecret :: Maybe MetricsSecret,
-    rsoMetricsOperationNameLimit :: Maybe (Refined Positive Int)
+    rsoMetricsOperationNameLimit :: Maybe (Refined Positive Int),
+    rsoMetricsOperationNamesFile :: Maybe Text
   }
 
 deriving stock instance (Show (Logging.EngineLogType impl)) => Show (ServeOptionsRaw impl)
@@ -734,7 +735,8 @@ data ServeOptions impl = ServeOptions
     soRelayMode :: RelayModeStatus,
     soRemoteSchemaHealingInterval :: OptionalInterval,
     soMetricsSecret :: Maybe Auth.AdminSecretHash,
-    soMetricsOperationNameLimit :: Refined Positive Int
+    soMetricsOperationNameLimit :: Refined Positive Int,
+    soMetricsOperationNamesFile :: Maybe Text
   }
 
 -- | 'ResponseInternalErrorsConfig' represents the encoding of the

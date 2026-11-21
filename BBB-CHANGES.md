@@ -260,7 +260,18 @@ always on.
   by default, configurable with `HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT` (or
   `--metrics-operation-name-limit`), read once at start; a value that is not a positive
   integer refuses the start, as the other positive integer options do. The 128 characters are
-  fixed. bbb-graphql-middleware has the same cap, `prometheus_operation_name_limit` in its
+  fixed. `HASURA_GRAPHQL_METRICS_OPERATION_NAMES_FILE` (or
+  `--metrics-operation-names-file`) optionally names a file read once at startup, with one
+  reserved operation name per line; blank lines and lines beginning with `#` are ignored.
+  Reserved names always keep their own labels and do not consume the limit. Invalid GraphQL
+  names and names longer than 128 characters are ignored with a warning. A missing or
+  unreadable file also warns and leaves the reserved set empty, without preventing startup.
+  The hot path still performs one in-memory set lookup: the admitted set starts with the
+  reserved names while its separate counter starts at zero. Therefore the worst-case set of
+  distinct values of the `operation_name` label is the configured limit plus the reserved-list
+  size, plus `(other)` and `(unnamed)`. The total series count is that set multiplied by each
+  metric's small fixed label dimensions, such as `subscription_kind`, `changed`, or
+  `operation_type` and `response_status`. bbb-graphql-middleware has the same cap, `prometheus_operation_name_limit` in its
   `config.yml`: the two should be changed together, so that the counts by name of the engine
   and of the middleware stay comparable. The option has no
   maximum: the memory held until a restart and the time and size of a scrape grow in
@@ -407,9 +418,9 @@ Every file below carries a modification notice at the top, as required by Apache
   specification of every exported metric) and `makePrometheusMetrics` (creates the same
   mutable references as `makeDummyPrometheusMetrics`, registered to a store), plus a
   `pmSample` field to sample the store.
-- `server/src-exec/Main.hs`: creates the Prometheus metric store and calls
-  `makePrometheusMetricsWithOperationNameLimit`, with the configured operation name limit,
-  instead of `makeDummyPrometheusMetrics`.
+- `server/src-exec/Main.hs`: reads the reserved operation names once, creates the Prometheus
+  metric store and calls `makePrometheusMetricsWithOperationNames`, with the configured limit
+  and reserved set, instead of `makeDummyPrometheusMetrics`.
 - `server/src-lib/Hasura/Server/App.hs`: adds the `GET /v1/metrics` endpoint.
 - `server/src-lib/Hasura/Server/Prometheus/EkgExport.hs` (new file): the EKG-to-Prometheus
   text conversion.
@@ -419,21 +430,25 @@ Every file below carries a modification notice at the top, as required by Apache
   `server/src-lib/Hasura/App/State.hs`: add the `HASURA_GRAPHQL_METRICS_SECRET` option and
   carry it into the app context. The first three also add the
   `HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT` option (see "Operation name labels" above),
-  which `server/src-exec/Main.hs` passes to the metrics.
-- `server/src-lib/Hasura/Server/Init/Logging.hs`: logs the operation name limit with the
-  serve options.
+  and `HASURA_GRAPHQL_METRICS_OPERATION_NAMES_FILE` options (see "Operation name labels"
+  above), which `server/src-exec/Main.hs` passes to the metrics.
+- `server/src-lib/Hasura/Server/Init/Logging.hs`: logs the operation name limit and reserved
+  names file with the serve options.
 - `server/src-test/Hasura/Server/InitSpec.hs`: adds the new raw serve option defaults, and
   tests that the metrics secret is read hashed and that a blank one counts as not set for
   both the environment and command-line option, and
   the operation name limit's default, its environment variable, that a parsed argument wins
-  over it, and that a value that is not a positive integer is refused.
+  over it, that a value that is not a positive integer is refused, and the reserved-names
+  file's absent and environment-variable cases.
 - `server/src-test/Hasura/Server/Init/ArgSpec.hs`: tests that the
-  `--metrics-operation-name-limit` argument accepts a positive integer and refuses 0.
+  `--metrics-operation-name-limit` argument accepts a positive integer and refuses 0, and
+  `--metrics-operation-names-file` accepts a path.
 - `server/test-postgres/Constants.hs` and `server/lib/test-harness/src/Harness/Constants.hs`:
   add the new serve option defaults to the test fixtures.
 - `server/src-test/Hasura/Server/PrometheusSpec.hs` (new file): tests that every metric
   registers without a `RegistrationError` and that the store exports exactly the expected
-  metric families once every vector metric has been observed.
+  metric families once every vector metric has been observed; also tests reserved names,
+  absent and missing files, and invalid lines.
 - `server/src-test/Hasura/Server/Prometheus/EkgExportSpec.hs` (new file): tests name
   uniqueness and the name grammar of the EKG conversion.
 - `server/graphql-engine.cabal`: registers the new modules.

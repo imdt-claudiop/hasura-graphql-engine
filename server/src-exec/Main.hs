@@ -1,6 +1,7 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- registers the Prometheus metrics to a metric store so that GET /v1/metrics
 -- can export them, with the configured number of operation names. See BBB-CHANGES.md.
+-- Reserved operation names are read once before the metrics store is created.
 module Main
   ( main,
   )
@@ -14,6 +15,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.Environment qualified as Env
 import Data.Int (Int64)
 import Data.Kind (Type)
+import Data.Text qualified as T
 import Data.Text.Conversions (convertText)
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -29,14 +31,15 @@ import Hasura.Backends.Postgres.Connection.MonadTx
 import Hasura.Backends.Postgres.Connection.Settings
 import Hasura.CpuDetect qualified as CpuDetect
 import Hasura.GC qualified as GC
-import Hasura.Logging (Hasura, LogLevel (..), defaultEnabledEngineLogTypes)
+import Hasura.Logging (Hasura, LogLevel (..), defaultEnabledEngineLogTypes, unLogger)
 import Hasura.Prelude
 import Hasura.RQL.DDL.Schema
 import Hasura.Server.App (CEConsoleType (OSSConsole))
 import Hasura.Server.Init
+import Hasura.Server.Init.Logging (mkGenericLog)
 import Hasura.Server.Metrics (ServerMetricsSpec, createServerMetrics)
 import Hasura.Server.Migrate (downgradeCatalog)
-import Hasura.Server.Prometheus (PrometheusMetricsSpec, makePrometheusMetricsWithOperationNameLimit)
+import Hasura.Server.Prometheus (PrometheusMetricsSpec, makePrometheusMetricsWithOperationNames, readOperationNamesFile)
 import Hasura.Server.Version
 import Hasura.ShutdownLatch
 import Hasura.Tracing (sampleAlways)
@@ -102,8 +105,15 @@ runApp env (HGEOptions rci metadataDbUrl hgeCmd) = do
 
         pure (EKG.subset EKG.emptyOf store, serverMetrics)
 
+      reservedOperationNames <-
+        lowerManagedT do
+          Loggers _ logger _ <- mkLoggers soEnabledLogTypes soLogLevel
+          liftIO
+            $ readOperationNamesFile
+              (unLogger logger . mkGenericLog @Text LevelWarn "metrics_operation_names_file")
+              (T.unpack <$> soMetricsOperationNamesFile)
       promMetricsStore <- liftIO $ Prometheus.newStore @PrometheusMetricsSpec
-      prometheusMetrics <- liftIO $ makePrometheusMetricsWithOperationNameLimit (unrefine soMetricsOperationNameLimit) promMetricsStore
+      prometheusMetrics <- liftIO $ makePrometheusMetricsWithOperationNames (unrefine soMetricsOperationNameLimit) reservedOperationNames promMetricsStore
 
       -- It'd be nice if we didn't have to call lowerManagedT twice here, but
       -- there is a data dependency problem since the call to runAppM below
