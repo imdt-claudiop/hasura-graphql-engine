@@ -264,8 +264,9 @@ always on.
   `--metrics-operation-names-file`) optionally names a file read once at startup, with one
   reserved operation name per line; blank lines and lines beginning with `#` are ignored.
   Reserved names always keep their own labels and do not consume the limit. Invalid GraphQL
-  names and names longer than 128 characters are ignored with a warning. A missing or
-  unreadable file also warns and leaves the reserved set empty, without preventing startup.
+  names and names longer than 128 characters are ignored with a warning, with long invalid
+  lines truncated in that warning. A missing or unreadable file also warns and leaves the
+  reserved set empty, without preventing startup.
   Admitted names and names read from the file are copied, so their series do not keep the
   query document or the file contents alive.
   The hot path still performs one in-memory set lookup: the admitted set starts with the

@@ -6,6 +6,7 @@
 -- subscription kind; labels operations by their capped name, always, without the query
 -- hash, up to a configurable number of names; adds the per-operation subscription metrics;
 -- reserves configured operation names outside that limit; copies the operation names it keeps;
+-- truncates an invalid line in the names file warning;
 -- sets the buckets of the subscription poll times; says in the help of the subscription
 -- database time that the pool wait is left out; describes what a full websocket send queue
 -- does in the help of its counter; adds the Postgres pool metrics and the pool observer that
@@ -151,11 +152,15 @@ readOperationNamesFile warn (Just path) = do
     parseLine (lineNumber, rawName)
       | T.null name || "#" `T.isPrefixOf` name = pure Nothing
       | T.compareLength name maxOperationNameLabelLength == GT || isNothing (G.mkName name) = do
-          warn $ "Ignoring invalid operation name on line " <> tshow lineNumber <> " of " <> T.pack path <> ": " <> name
+          warn $ "Ignoring invalid operation name on line " <> tshow lineNumber <> " of " <> T.pack path <> ": " <> shownName
           pure Nothing
       | otherwise = pure (Just (T.copy name))
       where
         name = T.strip rawName
+        shown = maxOperationNameLabelLength + 32
+        shownName
+          | T.compareLength name shown == GT = T.take shown name <> "... (truncated, " <> tshow (T.length name) <> " characters)"
+          | otherwise = name
 
 --------------------------------------------------------------------------------
 

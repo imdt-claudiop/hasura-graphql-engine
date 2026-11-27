@@ -337,6 +337,23 @@ operationNameLabelSpec = describe "operationNameLabel" $ do
     names `shouldBe` HashSet.fromList ["getUsers", "_128_is_valid"]
     readIORef warnings `shouldReturn` ["Ignoring invalid operation name on line 4 of " <> T.pack path <> ": not-valid"]
 
+  it "truncates a long invalid line in the warning" $ do
+    (path, handle) <- openTempFile "/tmp" "hasura-operation-names"
+    hClose handle
+    TextIO.writeFile path (T.replicate 10000 "-")
+    warnings <- newIORef []
+    _ <- readOperationNamesFile (modifyIORef' warnings . (:)) (Just path)
+    removeFile path
+    let expected =
+          "Ignoring invalid operation name on line 1 of "
+            <> T.pack path
+            <> ": "
+            <> T.replicate 160 "-"
+            <> "... (truncated, 10000 characters)"
+    readIORef warnings `shouldReturn` [expected]
+    warningsText <- readIORef warnings
+    warningsText `shouldSatisfy` all ((< 300) . T.length)
+
   it "copies every name read from the operation names file" $ do
     (path, handle) <- openTempFile "/tmp" "hasura-operation-names"
     hClose handle
