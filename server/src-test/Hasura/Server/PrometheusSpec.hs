@@ -1,3 +1,4 @@
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE QuasiQuotes #-}
 
 -- Added by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
@@ -21,11 +22,14 @@ import Data.HashSet qualified as HashSet
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
+import Data.Text.Array qualified as TextArray
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TextIO
+import Data.Text.Internal qualified as TextInternal
 import Data.UUID qualified as UUID
 import Database.PG.Query qualified as PG
 import GHC.AssertNF (isNF)
+import GHC.Exts (Int (I#), isTrue#, sameByteArray#, sizeofByteArray#)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Common (defaultSource)
@@ -254,6 +258,12 @@ pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time 
 operationNameLabelSpec :: Spec
 operationNameLabelSpec = describe "operationNameLabel" $ do
   let opName = Just . OperationName . G.unsafeMkName
+      -- text-2.x stores UTF-8 in a ByteArray. These structural checks make the
+      -- retention tests deterministic instead of relying on the garbage collector.
+      sharesArray (TextInternal.Text (TextArray.ByteArray left) _ _) (TextInternal.Text (TextArray.ByteArray right) _ _) =
+        isTrue# (sameByteArray# left right)
+      isCompact text@(TextInternal.Text (TextArray.ByteArray bytes) offset byteLength) =
+        offset == 0 && I# (sizeofByteArray# bytes) == byteLength && byteLength == T.length text
   it "caps the distinct names and their length" $ do
     defaultOperationNameLimit `shouldBe` 500
     metrics <- makeDummyPrometheusMetrics
@@ -282,6 +292,33 @@ operationNameLabelSpec = describe "operationNameLabel" $ do
     operationNameLabel metrics (opName "late") `shouldReturn` otherOperationLabel
     operationNameLabel metrics (opName "reserved") `shouldReturn` OperationNameLabel "reserved"
 
+  it "copies an admitted name out of its query text" $ do
+    metrics <- makeDummyPrometheusMetrics
+    let query = T.replicate 65536 "x" <> "getUsers" <> T.replicate 65536 "y"
+        input = T.take 8 (T.drop 65536 query)
+    OperationNameLabel stored <- operationNameLabel metrics (opName input)
+    stored `shouldBe` "getUsers"
+    stored `shouldSatisfy` (not . sharesArray input)
+    stored `shouldSatisfy` isCompact
+
+  it "returns the stored name on the fast path" $ do
+    metrics <- makeDummyPrometheusMetrics
+    let firstInput = T.take 8 (T.drop 1024 (T.replicate 1024 "x" <> "getUsers"))
+        secondInput = T.take 8 (T.drop 2048 (T.replicate 2048 "y" <> "getUsers"))
+    OperationNameLabel storedFirst <- operationNameLabel metrics (opName firstInput)
+    OperationNameLabel storedSecond <- operationNameLabel metrics (opName secondInput)
+    storedSecond `shouldSatisfy` sharesArray storedFirst
+    storedSecond `shouldSatisfy` (not . sharesArray secondInput)
+
+  it "returns the stored name when a failed request looks up an admitted name" $ do
+    metrics <- makeDummyPrometheusMetrics
+    operationNameLabel metrics (opName "getUsers") `shouldReturn` OperationNameLabel "getUsers"
+    let input = T.take 8 (T.drop 1024 (T.replicate 1024 "x" <> "getUsers"))
+    observed <- newIORef Nothing
+    recordGraphqlOperationMetric metrics (Just G.OperationTypeQuery) Failed (opName input) (writeIORef observed . fmap (unOperationNameLabel . _dslOperationName) . dynamic_label)
+    Just stored <- readIORef observed
+    stored `shouldSatisfy` (not . sharesArray input)
+
   it "uses no reserved names when the file option is absent or its file is missing" $ do
     warnings <- newIORef []
     absent <- readOperationNamesFile (modifyIORef' warnings . (:)) Nothing
@@ -299,6 +336,14 @@ operationNameLabelSpec = describe "operationNameLabel" $ do
     removeFile path
     names `shouldBe` HashSet.fromList ["getUsers", "_128_is_valid"]
     readIORef warnings `shouldReturn` ["Ignoring invalid operation name on line 4 of " <> T.pack path <> ": not-valid"]
+
+  it "copies every name read from the operation names file" $ do
+    (path, handle) <- openTempFile "/tmp" "hasura-operation-names"
+    hClose handle
+    TextIO.writeFile path "  getUsers  \n  getRooms  \n"
+    names <- readOperationNamesFile (const (pure ())) (Just path)
+    removeFile path
+    HashSet.toList names `shouldSatisfy` all isCompact
 
   it "counts two names past the cap in one poller as one (other), with their subscribers added" $ do
     metrics <- makeDummyPrometheusMetrics

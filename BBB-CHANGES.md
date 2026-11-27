@@ -266,6 +266,8 @@ always on.
   Reserved names always keep their own labels and do not consume the limit. Invalid GraphQL
   names and names longer than 128 characters are ignored with a warning. A missing or
   unreadable file also warns and leaves the reserved set empty, without preventing startup.
+  Admitted names and names read from the file are copied, so their series do not keep the
+  query document or the file contents alive.
   The hot path still performs one in-memory set lookup: the admitted set starts with the
   reserved names while its separate counter starts at zero. Therefore the worst-case set of
   distinct values of the `operation_name` label is the configured limit plus the reserved-list
@@ -417,7 +419,8 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-lib/Hasura/Server/Prometheus.hs`: adds `PrometheusMetricsSpec` (the static
   specification of every exported metric) and `makePrometheusMetrics` (creates the same
   mutable references as `makeDummyPrometheusMetrics`, registered to a store), plus a
-  `pmSample` field to sample the store.
+  `pmSample` field to sample the store; copied operation-name labels avoid retaining their
+  source query document or names file.
 - `server/src-exec/Main.hs`: reads the reserved operation names once, creates the Prometheus
   metric store and calls `makePrometheusMetricsWithOperationNames`, with the configured limit
   and reserved set, instead of `makeDummyPrometheusMetrics`.

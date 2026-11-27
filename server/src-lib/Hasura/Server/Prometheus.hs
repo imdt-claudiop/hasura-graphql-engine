@@ -5,7 +5,7 @@
 -- metrics, used by the GET /v1/metrics endpoint; observes a subscription poll once, by
 -- subscription kind; labels operations by their capped name, always, without the query
 -- hash, up to a configurable number of names; adds the per-operation subscription metrics;
--- reserves configured operation names outside that limit;
+-- reserves configured operation names outside that limit; copies the operation names it keeps;
 -- sets the buckets of the subscription poll times; says in the help of the subscription
 -- database time that the pool wait is left out; describes what a full websocket send queue
 -- does in the help of its counter; adds the Postgres pool metrics and the pool observer that
@@ -144,14 +144,16 @@ readOperationNamesFile warn (Just path) = do
     Left exception -> do
       warn $ "Could not read metrics operation names file " <> T.pack path <> ": " <> tshow exception
       pure mempty
-    Right text -> HashSet.fromList . catMaybes <$> traverse parseLine (zip [1 :: Int ..] (T.lines text))
+    Right text -> do
+      names <- traverse parseLine (zip [1 :: Int ..] (T.lines text))
+      pure $! HashSet.fromList (catMaybes names)
   where
     parseLine (lineNumber, rawName)
       | T.null name || "#" `T.isPrefixOf` name = pure Nothing
       | T.compareLength name maxOperationNameLabelLength == GT || isNothing (G.mkName name) = do
           warn $ "Ignoring invalid operation name on line " <> tshow lineNumber <> " of " <> T.pack path <> ": " <> name
           pure Nothing
-      | otherwise = pure (Just name)
+      | otherwise = pure (Just (T.copy name))
       where
         name = T.strip rawName
 
@@ -782,16 +784,17 @@ operationNameLabel PrometheusMetrics {pmOperationNameLabels, pmOperationNameLimi
     | T.compareLength text maxOperationNameLabelLength == GT -> pure otherOperationLabel
     | otherwise -> do
         (admitted, _) <- readIORef pmOperationNameLabels
-        if HashSet.member text admitted
-          then pure (OperationNameLabel text)
-          else atomicModifyIORef' pmOperationNameLabels \(names, count) ->
+        case HashSet.lookupElement text admitted of
+          Just stored -> pure (OperationNameLabel stored)
+          Nothing -> atomicModifyIORef' pmOperationNameLabels \(names, count) ->
             -- The count is kept alongside, as the size of a set is linear in it.
-            if HashSet.member text names
-              then ((names, count), OperationNameLabel text)
-              else
-                if count >= pmOperationNameLimit
-                  then ((names, count), otherOperationLabel)
-                  else ((HashSet.insert text names, count + 1), OperationNameLabel text)
+            case HashSet.lookupElement text names of
+              Just stored -> ((names, count), OperationNameLabel stored)
+              Nothing
+                | count >= pmOperationNameLimit -> ((names, count), otherOperationLabel)
+                | otherwise ->
+                    let !copied = T.copy text
+                     in ((HashSet.insert copied names, count + 1), OperationNameLabel copied)
     where
       text = G.unName name
 
@@ -812,7 +815,7 @@ admittedOperationNameLabel PrometheusMetrics {pmOperationNameLabels} = \case
   Just (OperationName name) -> do
     (admitted, _) <- readIORef pmOperationNameLabels
     let text = G.unName name
-    pure if HashSet.member text admitted then OperationNameLabel text else otherOperationLabel
+    pure $ maybe otherOperationLabel OperationNameLabel (HashSet.lookupElement text admitted)
 
 data SubscriptionLabel = SubscriptionLabel
   { _slKind :: SubscriptionKindLabel,
