@@ -1,6 +1,7 @@
 cabal-version:       2.2
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the Hasura.Server.Prometheus.EkgExport module, test modules and a benchmark. See BBB-CHANGES.md.
+-- adds the Hasura.Server.Prometheus.EkgExport module, test modules and a benchmark, and requires
+-- unordered-containers 0.2.21. See BBB-CHANGES.md.
 
 name:                graphql-engine
 version:             1.0.0
@@ -348,7 +349,7 @@ common lib-depends
                      , time-manager
                      , transformers
                      , transformers-base
-                     , unordered-containers >= 0.2.12
+                     , unordered-containers >= 0.2.21
                      , url
                      , utf8-string
                      , validation

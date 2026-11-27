@@ -530,5 +530,7 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/graphql-engine.cabal`: also registers the `subscription-metrics` benchmark
   (`server/bench-subscription-metrics/Main.hs`, new file; see "Benchmark of the subscription
   metrics" above).
+- `server/graphql-engine.cabal`: also raises the lower bound of `unordered-containers` to 0.2.21,
+  the version that added `Data.HashSet.lookupElement`, which the operation name labels use.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
