@@ -54,6 +54,7 @@ spec = do
   pollAndPoolTimeBucketsSpec
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
+  dbExecutionSecondsHelpSpec
   postgresPoolObserverSpec
   splitBySubscribersSpec
   cohortsGaugeSpec
@@ -208,13 +209,23 @@ postgresPoolObserverSpec = describe "postgresPoolObserver" $ do
 
 dbExecutionTimeHelpSpec :: Spec
 dbExecutionTimeHelpSpec = describe "hasura_subscription_db_execution_time_seconds" $ do
-  it "says in its help that the pool wait is left out" $ do
+  it "says in its help that the pool wait is left out on Postgres" $ do
     store <- Prometheus.newStore @PrometheusMetricsSpec
     metrics <- makePrometheusMetrics store
     observeEveryVectorOnce metrics
     rendered <- renderSample metrics
     filter ("# HELP hasura_subscription_db_execution_time_seconds " `T.isPrefixOf`) (T.lines rendered)
-      `shouldBe` ["# HELP hasura_subscription_db_execution_time_seconds Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"]
+      `shouldBe` ["# HELP hasura_subscription_db_execution_time_seconds Time spent executing the subscription query in the database, in seconds; on Postgres, the wait for a pool connection is left out"]
+
+dbExecutionSecondsHelpSpec :: Spec
+dbExecutionSecondsHelpSpec = describe "hasura_subscription_db_execution_seconds_total" $ do
+  it "says in its help that the pool wait is left out on Postgres" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observeEveryVectorOnce metrics
+    rendered <- renderSample metrics
+    filter ("# HELP hasura_subscription_db_execution_seconds_total " `T.isPrefixOf`) (T.lines rendered)
+      `shouldBe` ["# HELP hasura_subscription_db_execution_seconds_total Total time spent executing subscription queries in the database, in seconds; on Postgres, the pool wait is left out"]
 
 messagesDroppedHelpSpec :: Spec
 messagesDroppedHelpSpec = describe "hasura_websocket_messages_dropped_total" $ do

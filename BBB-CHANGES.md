@@ -171,8 +171,9 @@ simulated query that throws: a real connection drop was not tested, because a lo
 connection goes through the pg-client retry (`pgRetrying` resets the connection and runs the
 statement again), which makes it neither certain nor repeatable that the timed query ends
 with the exception.
-The help of `hasura_subscription_db_execution_time_seconds` says the pool wait is left
-out.
+The helps of `hasura_subscription_db_execution_time_seconds` and
+`hasura_subscription_db_execution_seconds_total` say that the pool wait is left out on
+Postgres; on MS SQL Server the time still includes it. The metric names are unchanged.
 
 ## Subscription poll time buckets
 
@@ -346,7 +347,7 @@ always on.
     the operations' parts add up to the poll's bytes. `changed="false"` here is the poll's
     waste: results the database returned that went to no one but new subscribers.
   - `hasura_subscription_db_execution_seconds_total` (the database execution time of the
-    poll's batches, added up, without the pool wait) and
+    poll's batches, added up; on Postgres, without the pool wait) and
     `hasura_subscription_poll_seconds_total` (the poll's time apportioned across the
     operations served by that poll) are split the same way.
     They are kept in whole microseconds (each batch's time and each poll's time truncated), so

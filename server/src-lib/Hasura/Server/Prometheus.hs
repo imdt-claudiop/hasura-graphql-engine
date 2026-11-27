@@ -7,10 +7,10 @@
 -- hash, up to a configurable number of names; adds the per-operation subscription metrics;
 -- reserves configured operation names outside that limit; copies the operation names it keeps;
 -- truncates an invalid line in the names file warning;
--- sets the buckets of the subscription poll times; says in the help of the subscription
--- database time that the pool wait is left out; describes what a full websocket send queue
--- does in the help of its counter; adds the Postgres pool metrics and the pool observer that
--- records them. See BBB-CHANGES.md.
+-- sets the buckets of the subscription poll times; says in the help of the subscription database
+-- times that the pool wait is left out on Postgres; describes what a full websocket send queue does
+-- in the help of its counter; adds the Postgres pool metrics and the pool observer that records them.
+-- See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -1101,7 +1101,7 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
   SubscriptionDbExecutionTimeSeconds ::
     PrometheusMetricsSpec
       "hasura_subscription_db_execution_time_seconds"
-      "Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"
+      "Time spent executing the subscription query in the database, in seconds; on Postgres, the wait for a pool connection is left out"
       'HistogramType
       SubscriptionKindLabel
   SubscriptionPollsTotal ::
@@ -1149,7 +1149,7 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
   SubscriptionDBExecutionSecondsTotal ::
     PrometheusMetricsSpec
       "hasura_subscription_db_execution_seconds_total"
-      "Total time spent executing subscription queries in the database, excluding the pool wait, in seconds"
+      "Total time spent executing subscription queries in the database, in seconds; on Postgres, the pool wait is left out"
       'CounterType
       SubscriptionLabel
   SubscriptionPollSecondsTotal ::
